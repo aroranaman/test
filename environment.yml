@@ -1,0 +1,43 @@
+name: manthan_gee
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  # Core Python
+  - python=3.11
+  - pip
+
+  # Geospatial Libraries
+  - gdal
+  - rasterio
+  - geopandas
+  - geopy
+
+  # Machine Learning
+  - pytorch
+  - torchvision
+  - scikit-learn
+  - lightgbm
+
+  # Data Handling & Database
+  - pandas
+  - numpy
+  - sqlalchemy
+  - psycopg2 # For PostgreSQL
+
+  # Cloud & APIs
+  - requests
+  - google-cloud-storage
+  - gcsfs
+
+  # Utilities
+  - jupyterlab
+  - notebook
+  - tqdm
+  
+  - pip:
+    - python-dotenv
+    - pygbif
+    - webdataset
+    - streamlit

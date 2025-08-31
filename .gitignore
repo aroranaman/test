@@ -1,0 +1,34 @@
+# Virtual envs
+manthan_env/
+.venv/
+venv/
+
+# Python caches & build
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# OS/IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Data & artifacts (keep small sample file)
+data/**
+!data/input/
+!data/input/sample_aoi.tif
+
+# Models (keep folder with README only)
+models/artifacts/**
+!models/README.md
+
+# TFRecords (never commit)
+Manthan_TFRecords*/**
+*.tfrecord
+*.tfrecord.gz
+
+# Notebooks cache / Streamlit cache
+.ipynb_checkpoints/
+.streamlit_cache/

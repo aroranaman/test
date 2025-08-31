@@ -1,0 +1,14 @@
+# requirements.txt
+pandas
+numpy
+torch
+torchvision
+streamlit
+geopy
+requests
+python-dotenv
+sqlalchemy
+psycopg2-binary
+# Geospatial libraries
+rasterio
+geopandas
