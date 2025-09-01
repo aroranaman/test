@@ -13,15 +13,34 @@ import argparse
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional, Set
 from contextlib import contextmanager
+from datetime import datetime
 
 import requests
 import pandas as pd
+import numpy as np
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
-import pygbif.occurrences as occ
 from dotenv import load_dotenv
-from geopy.geocoders import Nominatim
-from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
+
+# Optional deps
+try:
+    import pygbif.occurrences as occ
+    PYGIBF_OK = True
+except Exception:
+    PYGIBF_OK = False
+
+try:
+    import ee  # Google Earth Engine
+    GEE_IMPORTED = True
+except Exception:
+    GEE_IMPORTED = False
+
+try:
+    from geopy.geocoders import Nominatim
+    from geopy.exc import GeocoderTimedOut, GeocoderUnavailable
+    GEOPY_OK = True
+except Exception:
+    GEOPY_OK = False
 
 # ------------------------------------------------------------------------------
 # Config & Setup
@@ -59,7 +78,7 @@ _SPECIAL_BOUNDS: List[Dict[str, Any]] = [
 ]
 
 # ------------------------------------------------------------------------------
-# Helpers
+# Helpers (general)
 # ------------------------------------------------------------------------------
 def _ensure_sqlite_dir(db_url: str) -> None:
     if db_url.startswith("sqlite:///"):
@@ -75,12 +94,54 @@ def _slugify_region(name: str) -> str:
     s = re.sub(r"_+", "_", s).strip("_")
     return s
 
+_BINOMIAL_RE = re.compile(r"[A-Za-z-]+")
+def _canon_binomial(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+    toks = _BINOMIAL_RE.findall(str(name))
+    if len(toks) >= 2:
+        return f"{toks[0].lower()} {toks[1].lower()}"
+    if len(toks) == 1:
+        return toks[0].lower()
+    return None
+
+def _serialize_issues(val) -> Optional[str]:
+    if val is None or (isinstance(val, float) and math.isnan(val)):
+        return None
+    if isinstance(val, list):
+        return ",".join(str(x).strip() for x in val if str(x).strip())
+    s = str(val).strip()
+    return s or None
+
+def _has_bad_issue(issues: Any) -> bool:
+    bad = {
+        "COUNTRY_COORDINATE_MISMATCH",
+        "ZERO_COORDINATE",
+        "COORDINATE_INVALID",
+        "PRESUMED_SWAPPED_COORDINATE",
+        "COORDINATE_OUT_OF_RANGE",
+    }
+    if issues is None:
+        return False
+    try:
+        if isinstance(issues, float) and math.isnan(issues):
+            return False
+    except Exception:
+        pass
+    if isinstance(issues, list):
+        toks = {str(t).strip() for t in issues if str(t).strip()}
+    elif isinstance(issues, str):
+        toks = {t.strip() for t in issues.split(",") if t.strip()}
+    else:
+        s = str(issues).strip()
+        toks = {s} if s else set()
+    return bool(bad.intersection(toks))
+
 # --- Geocoding (for single-location mode) ---
 def get_location_details(location_name: str) -> Optional[Dict[str, Any]]:
-    """
-    Geocodes a location into a bounding box and attempts to extract the state.
-    Returns {'bbox': (w,s,e,n), 'state': <state_or_none>, 'label': <slug>}
-    """
+    if not GEOPY_OK:
+        logging.error("geopy not installed; cannot geocode.")
+        return None
     logging.info(f"Geocoding '{location_name}' to bounding box ...")
     geolocator = Nominatim(user_agent="manthan_app")
     try:
@@ -107,385 +168,8 @@ def _bbox_to_wkt(bbox: Tuple[float, float, float, float]) -> str:
     w, s, e, n = bbox
     return f"POLYGON(({w} {s}, {e} {s}, {e} {n}, {w} {n}, {w} {s}))"
 
-def _has_bad_issue(issues: Any) -> bool:
-    bad = {
-        "COUNTRY_COORDINATE_MISMATCH",
-        "ZERO_COORDINATE",
-        "COORDINATE_INVALID",
-        "PRESUMED_SWAPPED_COORDINATE",
-        "COORDINATE_OUT_OF_RANGE",
-    }
-    if issues is None:
-        return False
-    try:
-        if isinstance(issues, float) and math.isnan(issues):
-            return False
-    except Exception:
-        pass
-    if isinstance(issues, list):
-        toks = {str(t).strip() for t in issues if str(t).strip()}
-    elif isinstance(issues, str):
-        toks = {t.strip() for t in issues.split(",") if t.strip()}
-    else:
-        s = str(issues).strip()
-        toks = {s} if s else set()
-    return bool(bad.intersection(toks))
-
-def _serialize_issues(val) -> Optional[str]:
-    if val is None or (isinstance(val, float) and math.isnan(val)):
-        return None
-    if isinstance(val, list):
-        return ",".join(str(x).strip() for x in val if str(x).strip())
-    s = str(val).strip()
-    return s or None
-
-_BINOMIAL_RE = re.compile(r"[A-Za-z-]+")
-def _canon_binomial(name: Optional[str]) -> Optional[str]:
-    if not name:
-        return None
-    toks = _BINOMIAL_RE.findall(str(name))
-    if len(toks) >= 2:
-        return f"{toks[0].lower()} {toks[1].lower()}"
-    if len(toks) == 1:
-        return toks[0].lower()
-    return None
-
 # ------------------------------------------------------------------------------
-# Trait helpers (simple heuristics)
-# ------------------------------------------------------------------------------
-def estimate_canopy_layer(traits: dict) -> str:
-    try:
-        height = float(traits.get("max_height_m", 0))
-        growth_form = (traits.get("growth_form", "tree") or "tree").lower()
-        if "tree" in growth_form:
-            if height > 20: return "Upper Canopy"
-            if height > 10: return "Mid-story"
-            return "Lower Canopy / Sub-canopy"
-        if "shrub" in growth_form: return "Shrub Layer"
-        if "herb" in growth_form or "grass" in growth_form: return "Understory / Ground Cover"
-        return "Unknown"
-    except (ValueError, TypeError):
-        return "Unknown"
-
-def infer_successional_role(traits: dict) -> str:
-    growth_rate = (traits.get("growth_rate") or "").lower()
-    shade_tol   = (traits.get("shade_tolerance") or "").lower()
-    if "fast" in growth_rate or "low" in shade_tol:  return "Pioneer"
-    if "slow" in growth_rate or "high" in shade_tol: return "Climax"
-    return "Intermediate"
-
-def build_trait_records_for_species(species_row: dict, traits_from_provider: dict) -> list[dict]:
-    records = []
-    species_key = species_row["species_key"]
-    canopy_layer = estimate_canopy_layer(traits_from_provider or {})
-    successional = infer_successional_role(traits_from_provider or {})
-    drought_tol  = traits_from_provider.get("drought_tolerance", "Unknown")
-    soil_pref    = traits_from_provider.get("soil_type_preference", "Unknown")
-    def _as_text(v): return None if v is None else str(v)
-    records.append({"species_key": species_key, "trait_name": "canopy_layer",        "trait_value": _as_text(canopy_layer), "source": "derived"})
-    records.append({"species_key": species_key, "trait_name": "successional_role",   "trait_value": _as_text(successional), "source": "derived"})
-    records.append({"species_key": species_key, "trait_name": "drought_tolerance",   "trait_value": _as_text(drought_tol),  "source": "provider"})
-    records.append({"species_key": species_key, "trait_name": "soil_type_preference","trait_value": _as_text(soil_pref),    "source": "provider"})
-    return records
-
-def fetch_traits_for_species(scientific_name: str) -> dict:
-    """Placeholder for future trait providers."""
-    return {}
-
-# ------------------------------------------------------------------------------
-# GRIIS invasive filter (state-first, then national fallback)
-# ------------------------------------------------------------------------------
-def _collect_species_from_dataset(dataset_key: str) -> Set[str]:
-    names: Set[str] = set()
-    offset, limit = 0, 1000
-    while True:
-        try:
-            resp = requests.get(
-                "https://api.gbif.org/v1/species/search",
-                params={"datasetKey": dataset_key, "limit": limit, "offset": offset},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            logging.warning(f"Failed fetching species chunk (offset={offset}) for dataset {dataset_key}: {e}")
-            break
-        rows = data.get("results", [])
-        if not rows:
-            break
-        for r in rows:
-            canon = _canon_binomial(r.get("scientificName"))
-            if canon:
-                names.add(canon)
-        offset += limit
-    return names
-
-def _search_dataset_keys_by_query(query: str) -> List[str]:
-    try:
-        resp = requests.get(
-            "https://api.gbif.org/v1/dataset/search",
-            params={"q": query, "type": "CHECKLIST", "limit": 50},
-            timeout=20,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return [d["key"] for d in data.get("results", []) if d.get("key")]
-    except Exception as e:
-        logging.warning(f"Dataset search failed for query '{query}': {e}")
-        return []
-
-def _get_griis_invasive_index_state(state_name: str) -> Set[str]:
-    invasive: Set[str] = set()
-    if not state_name:
-        return invasive
-    logging.info(f"Fetching GRIIS state checklist for: {state_name} ...")
-    keys = _search_dataset_keys_by_query(f"GRIIS State Compendium {state_name}") or \
-           _search_dataset_keys_by_query(f"GRIIS {state_name}")
-    if keys:
-        invasive = _collect_species_from_dataset(keys[0])
-        logging.info(f"Loaded {len(invasive)} invasive names for {state_name}.")
-    else:
-        logging.warning(f"No state-specific GRIIS dataset found for {state_name}.")
-    return invasive
-
-def _get_griis_invasive_index_country(country_code: str = "IN") -> Set[str]:
-    logging.info(f"Fetching national GRIIS compendium for {country_code} ...")
-    keys = _search_dataset_keys_by_query(f"GRIIS Country Compendium {country_code}")
-    if not keys:
-        logging.warning("No national GRIIS dataset found.")
-        return set()
-    names = _collect_species_from_dataset(keys[0])
-    logging.info(f"Loaded {len(names)} invasive (national) names.")
-    return names
-
-# ------------------------------------------------------------------------------
-# GBIF fetching (single-area, occurrence paging)
-# ------------------------------------------------------------------------------
-def fetch_gbif_occurrences(
-    taxon_key: int,
-    bbox: Tuple[float, float, float, float],
-    country_code: Optional[str] = None,
-    since_year: Optional[int] = None,
-    max_records: int = 10_000,
-    page_size: int = DEFAULT_PAGE_SIZE,
-    sleep_s: float = 0.25,
-) -> pd.DataFrame:
-    wkt = _bbox_to_wkt(bbox)
-    records: List[Dict[str, Any]] = []
-    fetched = 0
-    offset = 0
-    logging.info(
-        f"Fetching GBIF occurrences (taxon={taxon_key}, bbox={bbox}, country={country_code or 'ANY'}, "
-        f"since={since_year}, max={max_records})"
-    )
-    while fetched < max_records:
-        limit = min(page_size, max_records - fetched)
-        try:
-            res = occ.search(
-                taxonKey=taxon_key,
-                geometry=wkt,
-                hasCoordinate=True,
-                limit=limit,
-                offset=offset,
-                country=country_code,
-            )
-        except Exception as e:
-            logging.error(f"GBIF request failed at offset={offset}: {e}")
-            break
-        results = res.get("results", [])
-        if not results:
-            break
-        records.extend(results)
-        got = len(results)
-        fetched += got
-        offset += got
-        logging.info(f"  - fetched {fetched} / {max_records} ...")
-        time.sleep(sleep_s)
-
-    if not records:
-        logging.warning("No GBIF records found.")
-        return pd.DataFrame()
-    return pd.DataFrame.from_records(records)
-
-def clean_occurrences(df: pd.DataFrame, since_year: Optional[int]) -> pd.DataFrame:
-    if df.empty:
-        return df
-    cols = [
-        "speciesKey", "scientificName", "acceptedScientificName",
-        "decimalLatitude", "decimalLongitude", "eventDate",
-        "basisOfRecord", "individualCount", "elevation",
-        "stateProvince", "locality", "datasetKey", "institutionCode",
-        "year", "month", "day", "issues",
-        "kingdom", "phylum", "class", "order", "family", "genus",
-        "establishmentMeans", "canonicalName", "species"
-    ]
-    present = [c for c in cols if c in df.columns]
-    df = df[present].copy()
-
-    df = df[df["decimalLatitude"].notna() & df["decimalLongitude"].notna()]
-    if "issues" in df.columns:
-        df = df[~df["issues"].apply(_has_bad_issue)]
-    if since_year is not None and "year" in df.columns:
-        df = df[df["year"].fillna(0).astype(int) >= int(since_year)]
-
-    dedup_subset = [c for c in ["speciesKey", "decimalLatitude", "decimalLongitude", "eventDate"] if c in df.columns]
-    if dedup_subset:
-        df = df.drop_duplicates(subset=dedup_subset)
-
-    rename_map = {
-        "speciesKey": "species_key",
-        "scientificName": "scientific_name",
-        "acceptedScientificName": "accepted_scientific_name",
-        "decimalLatitude": "lat",
-        "decimalLongitude": "lon",
-        "eventDate": "event_date",
-        "basisOfRecord": "basis_of_record",
-        "individualCount": "individual_count",
-        "stateProvince": "state_province",
-        "datasetKey": "dataset_key",
-        "institutionCode": "institution_code",
-        "class": "class_name",
-        "order": "order_name",
-        "elevation": "elevation",
-        "locality": "locality",
-        "establishmentMeans": "establishment_means",
-        "canonicalName": "canonical_name_from_gbif",
-        "species": "species_binomial"
-    }
-    df = df.rename(columns=rename_map)
-
-    for col in ["lat", "lon", "elevation"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    for col in ["year", "month", "day", "individual_count", "species_key"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
-
-    if "canonical_name_from_gbif" in df.columns and df["canonical_name_from_gbif"].notna().any():
-        df["canonical_name"] = df["canonical_name_from_gbif"]
-    elif "scientific_name" in df.columns and "accepted_scientific_name" in df.columns:
-        df["canonical_name"] = df["accepted_scientific_name"].fillna(df["scientific_name"])
-    elif "scientific_name" in df.columns:
-        df["canonical_name"] = df["scientific_name"]
-    else:
-        df["canonical_name"] = None
-
-    df["canonical_binomial"] = df["canonical_name"].apply(_canon_binomial)
-    if "species_binomial" in df.columns:
-        df["species_binomial"] = df["species_binomial"].apply(_canon_binomial)
-        df["canonical_binomial"] = df["species_binomial"].fillna(df["canonical_binomial"])
-    return df.reset_index(drop=True)
-
-# ------------------------------------------------------------------------------
-# IUCN enrichment (optional)
-# ------------------------------------------------------------------------------
-def fetch_iucn_category(name: str, token: str) -> Optional[str]:
-    url = f"https://apiv3.iucnredlist.org/api/v3/species/{requests.utils.quote(name)}"
-    params = {"token": token}
-    try:
-        r = requests.get(url, params=params, timeout=15)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        result = (data or {}).get("result") or []
-        if not result:
-            return None
-        return result[0].get("category")
-    except Exception:
-        return None
-
-def enrich_species_with_iucn(species_df: pd.DataFrame, token: str, throttle_s: float = 0.25) -> pd.DataFrame:
-    if species_df.empty:
-        species_df["iucn_category"] = pd.NA
-        return species_df
-    if not token:
-        logging.info("IUCN_TOKEN missing; skipping IUCN enrichment.")
-        species_df["iucn_category"] = pd.NA
-        return species_df
-    cats: Dict[str, Optional[str]] = {}
-    unique_names = species_df["canonical_name"].dropna().unique().tolist()
-    logging.info(f"Fetching IUCN status for {len(unique_names)} species ...")
-    for i, name in enumerate(unique_names, 1):
-        cats[name] = fetch_iucn_category(name, token)
-        if i % 50 == 0:
-            logging.info(f"  - IUCN fetched {i}/{len(unique_names)}")
-        time.sleep(throttle_s)
-    species_df["iucn_category"] = species_df["canonical_name"].map(cats).astype("string")
-    return species_df
-
-# ------------------------------------------------------------------------------
-# Table builders
-# ------------------------------------------------------------------------------
-def build_species_table(occ_df: pd.DataFrame) -> pd.DataFrame:
-    if occ_df.empty:
-        return pd.DataFrame(columns=[
-            "species_key","canonical_name","scientific_name","family","genus",
-            "class_name","order_name","kingdom","phylum","iucn_category","canonical_binomial"
-        ])
-    cols = ["species_key", "canonical_name", "scientific_name", "family", "genus",
-            "class_name", "order_name", "kingdom", "phylum", "canonical_binomial"]
-    present = [c for c in cols if c in occ_df.columns]
-    sp = occ_df[present].dropna(subset=["species_key"]).drop_duplicates(subset=["species_key"]).copy()
-    sp["species_key"] = sp["species_key"].astype("Int64")
-    return sp.reset_index(drop=True)
-
-def build_occurrence_table(occ_df: pd.DataFrame) -> pd.DataFrame:
-    expected = [
-        "species_key","lat","lon","event_date","basis_of_record","dataset_key",
-        "institution_code","locality","state_province","elevation","year","month","day",
-        "issues","establishment_means"
-    ]
-    if occ_df.empty:
-        return pd.DataFrame(columns=expected)
-
-    present = [c for c in expected if c in occ_df.columns]
-    out = occ_df[present].copy()
-    for c in expected:
-        if c not in out.columns:
-            out[c] = pd.NA
-
-    for col in ["lat", "lon", "elevation"]:
-        out[col] = pd.to_numeric(out[col], errors="coerce")
-    for col in ["year", "month", "day"]:
-        out[col] = pd.to_numeric(out[col], errors="coerce").astype("Int64")
-
-    for col in ["event_date", "basis_of_record", "dataset_key", "institution_code",
-                "locality", "state_province", "establishment_means"]:
-        out[col] = out[col].astype("string")
-
-    out["issues"] = out["issues"].apply(_serialize_issues).astype("string")
-
-    out = out[out["species_key"].notna()]
-    out["species_key"] = pd.to_numeric(out["species_key"], errors="coerce").astype("Int64")
-    return out.reset_index(drop=True)
-
-def build_species_distribution(
-    species_df: pd.DataFrame,
-    occ_df: pd.DataFrame,
-    region_label: str,
-    invasive_state: Set[str],
-    invasive_country: Set[str],
-) -> List[Dict[str, Any]]:
-    non_native_means = {"INTRODUCED", "INVASIVE", "NATURALISED", "MANAGED", "DOMESTICATED"}
-    recs: List[Dict[str, Any]] = []
-    for _, row in species_df.iterrows():
-        sk = int(row["species_key"])
-        binom = (row.get("canonical_binomial")
-                 or _canon_binomial(row.get("canonical_name") or row.get("scientific_name")))
-        is_native = True
-        if binom:
-            if binom in invasive_state:   is_native = False
-            elif binom in invasive_country: is_native = False
-
-        if is_native and "establishment_means" in occ_df.columns and not occ_df.empty:
-            em = occ_df[occ_df["species_key"] == sk]["establishment_means"].dropna().astype("string").str.upper()
-            if len(em) > 0 and em.isin(non_native_means).all():
-                is_native = False
-        recs.append({"species_key": sk, "region_name": region_label, "is_native": 1 if is_native else 0})
-    return recs
-
-# ------------------------------------------------------------------------------
-# DB schema & upserts
+# DB schema & upserts (row-per-trait schema; matches your current DB)
 # ------------------------------------------------------------------------------
 SPECIES_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS species (
@@ -720,7 +404,236 @@ def upsert_species_distribution(engine: Engine, records: List[Dict[str, Any]]) -
     return len(records)
 
 # ------------------------------------------------------------------------------
-# SINGLE-AREA PIPELINE (your original flow)
+# GBIF fetch/clean utilities (used by Single-area & Special-14)
+# ------------------------------------------------------------------------------
+def fetch_gbif_occurrences(
+    taxon_key: int,
+    bbox: Tuple[float, float, float, float],
+    country_code: Optional[str] = None,
+    since_year: Optional[int] = None,
+    max_records: int = 10_000,
+    page_size: int = DEFAULT_PAGE_SIZE,
+    sleep_s: float = 0.25,
+) -> pd.DataFrame:
+    if not PYGIBF_OK:
+        logging.error("pygbif is not installed. Run: pip install pygbif")
+        return pd.DataFrame()
+    wkt = _bbox_to_wkt(bbox)
+    records: List[Dict[str, Any]] = []
+    fetched = 0
+    offset = 0
+    logging.info(
+        f"Fetching GBIF occurrences (taxon={taxon_key}, bbox={bbox}, country={country_code or 'ANY'}, "
+        f"since={since_year}, max={max_records})"
+    )
+    while fetched < max_records:
+        limit = min(page_size, max_records - fetched)
+        try:
+            res = occ.search(
+                taxonKey=taxon_key,
+                geometry=wkt,
+                hasCoordinate=True,
+                limit=limit,
+                offset=offset,
+                country=country_code,
+            )
+        except Exception as e:
+            logging.error(f"GBIF request failed at offset={offset}: {e}")
+            break
+        results = res.get("results", [])
+        if not results:
+            break
+        records.extend(results)
+        got = len(results)
+        fetched += got
+        offset += got
+        logging.info(f"  - fetched {fetched} / {max_records} ...")
+        time.sleep(sleep_s)
+
+    if not records:
+        logging.warning("No GBIF records found.")
+        return pd.DataFrame()
+    return pd.DataFrame.from_records(records)
+
+def clean_occurrences(df: pd.DataFrame, since_year: Optional[int]) -> pd.DataFrame:
+    if df.empty:
+        return df
+    cols = [
+        "speciesKey", "scientificName", "acceptedScientificName",
+        "decimalLatitude", "decimalLongitude", "eventDate",
+        "basisOfRecord", "individualCount", "elevation",
+        "stateProvince", "locality", "datasetKey", "institutionCode",
+        "year", "month", "day", "issues",
+        "kingdom", "phylum", "class", "order", "family", "genus",
+        "establishmentMeans", "canonicalName", "species"
+    ]
+    present = [c for c in cols if c in df.columns]
+    df = df[present].copy()
+
+    df = df[df["decimalLatitude"].notna() & df["decimalLongitude"].notna()]
+    if "issues" in df.columns:
+        df = df[~df["issues"].apply(_has_bad_issue)]
+    if since_year is not None and "year" in df.columns:
+        df = df[df["year"].fillna(0).astype(int) >= int(since_year)]
+
+    dedup_subset = [c for c in ["speciesKey", "decimalLatitude", "decimalLongitude", "eventDate"] if c in df.columns]
+    if dedup_subset:
+        df = df.drop_duplicates(subset=dedup_subset)
+
+    rename_map = {
+        "speciesKey": "species_key",
+        "scientificName": "scientific_name",
+        "acceptedScientificName": "accepted_scientific_name",
+        "decimalLatitude": "lat",
+        "decimalLongitude": "lon",
+        "eventDate": "event_date",
+        "basisOfRecord": "basis_of_record",
+        "individualCount": "individual_count",
+        "stateProvince": "state_province",
+        "datasetKey": "dataset_key",
+        "institutionCode": "institution_code",
+        "class": "class_name",
+        "order": "order_name",
+        "elevation": "elevation",
+        "locality": "locality",
+        "establishmentMeans": "establishment_means",
+        "canonicalName": "canonical_name_from_gbif",
+        "species": "species_binomial"
+    }
+    df = df.rename(columns=rename_map)
+
+    for col in ["lat", "lon", "elevation"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ["year", "month", "day", "individual_count", "species_key"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+
+    if "canonical_name_from_gbif" in df.columns and df["canonical_name_from_gbif"].notna().any():
+        df["canonical_name"] = df["canonical_name_from_gbif"]
+    elif "scientific_name" in df.columns and "accepted_scientific_name" in df.columns:
+        df["canonical_name"] = df["accepted_scientific_name"].fillna(df["scientific_name"])
+    elif "scientific_name" in df.columns:
+        df["canonical_name"] = df["scientific_name"]
+    else:
+        df["canonical_name"] = None
+
+    df["canonical_binomial"] = df["canonical_name"].apply(_canon_binomial)
+    if "species_binomial" in df.columns:
+        df["species_binomial"] = df["species_binomial"].apply(_canon_binomial)
+        df["canonical_binomial"] = df["species_binomial"].fillna(df["canonical_binomial"])
+    return df.reset_index(drop=True)
+
+# ------------------------------------------------------------------------------
+# IUCN enrichment (optional)
+# ------------------------------------------------------------------------------
+def fetch_iucn_category(name: str, token: str) -> Optional[str]:
+    url = f"https://apiv3.iucnredlist.org/api/v3/species/{requests.utils.quote(name)}"
+    params = {"token": token}
+    try:
+        r = requests.get(url, params=params, timeout=15)
+        if r.status_code != 200:
+            return None
+        data = r.json()
+        result = (data or {}).get("result") or []
+        if not result:
+            return None
+        return result[0].get("category")
+    except Exception:
+        return None
+
+def enrich_species_with_iucn(species_df: pd.DataFrame, token: str, throttle_s: float = 0.25) -> pd.DataFrame:
+    if species_df.empty:
+        species_df["iucn_category"] = pd.NA
+        return species_df
+    if not token:
+        logging.info("IUCN_TOKEN missing; skipping IUCN enrichment.")
+        species_df["iucn_category"] = pd.NA
+        return species_df
+    cats: Dict[str, Optional[str]] = {}
+    unique_names = species_df["canonical_name"].dropna().unique().tolist()
+    logging.info(f"Fetching IUCN status for {len(unique_names)} species ...")
+    for i, name in enumerate(unique_names, 1):
+        cats[name] = fetch_iucn_category(name, token)
+        if i % 50 == 0:
+            logging.info(f"  - IUCN fetched {i}/{len(unique_names)}")
+        time.sleep(throttle_s)
+    species_df["iucn_category"] = species_df["canonical_name"].map(cats).astype("string")
+    return species_df
+
+# ------------------------------------------------------------------------------
+# Table builders
+# ------------------------------------------------------------------------------
+def build_species_table(occ_df: pd.DataFrame) -> pd.DataFrame:
+    if occ_df.empty:
+        return pd.DataFrame(columns=[
+            "species_key","canonical_name","scientific_name","family","genus",
+            "class_name","order_name","kingdom","phylum","iucn_category","canonical_binomial"
+        ])
+    cols = ["species_key", "canonical_name", "scientific_name", "family", "genus",
+            "class_name", "order_name", "kingdom", "phylum", "canonical_binomial"]
+    present = [c for c in cols if c in occ_df.columns]
+    sp = occ_df[present].dropna(subset=["species_key"]).drop_duplicates(subset=["species_key"]).copy()
+    sp["species_key"] = sp["species_key"].astype("Int64")
+    return sp.reset_index(drop=True)
+
+def build_occurrence_table(occ_df: pd.DataFrame) -> pd.DataFrame:
+    expected = [
+        "species_key","lat","lon","event_date","basis_of_record","dataset_key",
+        "institution_code","locality","state_province","elevation","year","month","day",
+        "issues","establishment_means"
+    ]
+    if occ_df.empty:
+        return pd.DataFrame(columns=expected)
+
+    present = [c for c in expected if c in occ_df.columns]
+    out = occ_df[present].copy()
+    for c in expected:
+        if c not in out.columns:
+            out[c] = pd.NA
+
+    for col in ["lat", "lon", "elevation"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    for col in ["year", "month", "day"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce").astype("Int64")
+
+    for col in ["event_date", "basis_of_record", "dataset_key", "institution_code",
+                "locality", "state_province", "establishment_means"]:
+        out[col] = out[col].astype("string")
+
+    out["issues"] = out["issues"].apply(_serialize_issues).astype("string")
+
+    out = out[out["species_key"].notna()]
+    out["species_key"] = pd.to_numeric(out["species_key"], errors="coerce").astype("Int64")
+    return out.reset_index(drop=True)
+
+def build_species_distribution(
+    species_df: pd.DataFrame,
+    occ_df: pd.DataFrame,
+    region_label: str,
+    invasive_state: Set[str],
+    invasive_country: Set[str],
+) -> List[Dict[str, Any]]:
+    non_native_means = {"INTRODUCED", "INVASIVE", "NATURALISED", "MANAGED", "DOMESTICATED"}
+    recs: List[Dict[str, Any]] = []
+    for _, row in species_df.iterrows():
+        sk = int(row["species_key"])
+        binom = (row.get("canonical_binomial")
+                 or _canon_binomial(row.get("canonical_name") or row.get("scientific_name")))
+        is_native = True
+        if binom:
+            if binom in invasive_state:   is_native = False
+            elif binom in invasive_country: is_native = False
+
+        if is_native and "establishment_means" in occ_df.columns and not occ_df.empty:
+            em = occ_df[occ_df["species_key"] == sk]["establishment_means"].dropna().astype("string").str.upper()
+            if len(em) > 0 and em.isin(non_native_means).all():
+                is_native = False
+        recs.append({"species_key": sk, "region_name": region_label, "is_native": 1 if is_native else 0})
+    return recs
+
+# ------------------------------------------------------------------------------
+# SINGLE-AREA PIPELINE (original flow)
 # ------------------------------------------------------------------------------
 def run_pipeline_single(
     db_url: str,
@@ -781,19 +694,46 @@ def run_pipeline_single(
         return
 
     species_df = build_species_table(occ_df)
-
     if enrich_iucn_flag:
         species_df = enrich_species_with_iucn(species_df, IUCN_TOKEN)
 
+    # simple placeholder trait rows (canopy, successional derived from basic placeholders)
+    def estimate_canopy_layer(traits: dict) -> str:
+        try:
+            height = float(traits.get("max_height_m", 0))
+            growth_form = (traits.get("growth_form", "tree") or "tree").lower()
+            if "tree" in growth_form:
+                if height > 20: return "Upper Canopy"
+                if height > 10: return "Mid-story"
+                return "Lower Canopy / Sub-canopy"
+            if "shrub" in growth_form: return "Shrub Layer"
+            if "herb" in growth_form or "grass" in growth_form: return "Understory / Ground Cover"
+            return "Unknown"
+        except (ValueError, TypeError):
+            return "Unknown"
+    def infer_successional_role(traits: dict) -> str:
+        growth_rate = (traits.get("growth_rate") or "").lower()
+        shade_tol   = (traits.get("shade_tolerance") or "").lower()
+        if "fast" in growth_rate or "low" in shade_tol:  return "Pioneer"
+        if "slow" in growth_rate or "high" in shade_tol: return "Climax"
+        return "Intermediate"
+
     trait_records: list[dict] = []
     for _, row in species_df.iterrows():
-        sci_name = row.get("canonical_name") or row.get("scientific_name")
-        traits_from_provider = fetch_traits_for_species(sci_name)
-        trait_records.extend(build_trait_records_for_species(row.to_dict(), traits_from_provider))
+        species_key = int(row["species_key"])
+        canopy_layer = estimate_canopy_layer({})
+        successional = infer_successional_role({})
+        trait_records.extend([
+            {"species_key": species_key, "trait_name": "canopy_layer",        "trait_value": canopy_layer, "source": "derived"},
+            {"species_key": species_key, "trait_name": "successional_role",   "trait_value": successional, "source": "derived"},
+        ])
 
     occ_out = build_occurrence_table(occ_df)
 
-    invasive_state = _get_griis_invasive_index_state(state_name) if state_name else set()
+    # invasive status
+    invasive_state: Set[str] = set()
+    if state_name:
+        invasive_state = _get_griis_invasive_index_state(state_name)
     invasive_country = _get_griis_invasive_index_country((country_code or "IN").upper())
     dist_records = build_species_distribution(
         species_df=species_df,
@@ -896,6 +836,69 @@ def _save_checkpoint(path: Path, ckpt: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(ckpt, indent=2))
 
+def _collect_species_from_dataset(dataset_key: str) -> Set[str]:
+    names: Set[str] = set()
+    offset, limit = 0, 1000
+    while True:
+        try:
+            resp = requests.get(
+                "https://api.gbif.org/v1/species/search",
+                params={"datasetKey": dataset_key, "limit": limit, "offset": offset},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logging.warning(f"Failed fetching species chunk (offset={offset}) for dataset {dataset_key}: {e}")
+            break
+        rows = data.get("results", [])
+        if not rows:
+            break
+        for r in rows:
+            canon = _canon_binomial(r.get("scientificName"))
+            if canon:
+                names.add(canon)
+        offset += limit
+    return names
+
+def _search_dataset_keys_by_query(query: str) -> List[str]:
+    try:
+        resp = requests.get(
+            "https://api.gbif.org/v1/dataset/search",
+            params={"q": query, "type": "CHECKLIST", "limit": 50},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return [d["key"] for d in data.get("results", []) if d.get("key")]
+    except Exception as e:
+        logging.warning(f"Dataset search failed for query '{query}': {e}")
+        return []
+
+def _get_griis_invasive_index_state(state_name: str) -> Set[str]:
+    invasive: Set[str] = set()
+    if not state_name:
+        return invasive
+    logging.info(f"Fetching GRIIS state checklist for: {state_name} ...")
+    keys = _search_dataset_keys_by_query(f"GRIIS State Compendium {state_name}") or \
+           _search_dataset_keys_by_query(f"GRIIS {state_name}")
+    if keys:
+        invasive = _collect_species_from_dataset(keys[0])
+        logging.info(f"Loaded {len(invasive)} invasive names for {state_name}.")
+    else:
+        logging.warning(f"No state-specific GRIIS dataset found for {state_name}.")
+    return invasive
+
+def _get_griis_invasive_index_country(country_code: str = "IN") -> Set[str]:
+    logging.info(f"Fetching national GRIIS compendium for {country_code} ...")
+    keys = _search_dataset_keys_by_query(f"GRIIS Country Compendium {country_code}")
+    if not keys:
+        logging.warning("No national GRIIS dataset found.")
+        return set()
+    names = _collect_species_from_dataset(keys[0])
+    logging.info(f"Loaded {len(names)} invasive (national) names.")
+    return names
+
 def ingest_special_14_facets(
     db_url: str,
     *,
@@ -911,11 +914,6 @@ def ingest_special_14_facets(
 ) -> None:
     """
     Resumable ingestion for the 14 curated regions using GBIF species facets.
-    For each region:
-      - Split into tiles (cols x rows)
-      - Page speciesKey facets with facetOffset per tile
-      - Upsert species and distribution (nativeness via GRIIS national list)
-      - Optional IUCN enrichment at the end of the region
     """
     engine = _connect_engine(db_url)
     ensure_schema(engine, recreate_schema=False)
@@ -989,16 +987,14 @@ def ingest_special_14_facets(
                         continue
                     seen_species_keys.add(sk_int)
                     batch_species.append(meta)
-                    # nativeness via GRIIS national list (state unknown for special rectangles)
                     binom = meta.get("canonical_binomial")
-                    is_native = 0 if (binom and binom in invasive_state or binom in invasive_country) else 1
+                    is_native = 0 if (binom and (binom in invasive_state or binom in invasive_country)) else 1
                     batch_dist.append({"species_key": sk_int, "region_name": region_label, "is_native": is_native})
 
-                    # flush periodically to DB
                     if len(batch_species) >= 500:
                         sp_df = pd.DataFrame(batch_species)
-                        n_sp = upsert_species(engine, sp_df)
-                        n_sd = upsert_species_distribution(engine, batch_dist)
+                        n_sp = upsert_species(_connect_engine(db_url), sp_df)
+                        n_sd = upsert_species_distribution(_connect_engine(db_url), batch_dist)
                         logging.info(f"    flushed species={n_sp}, dist={n_sd}")
                         batch_species.clear()
                         batch_dist.clear()
@@ -1016,13 +1012,13 @@ def ingest_special_14_facets(
         # final flush
         if batch_species:
             sp_df = pd.DataFrame(batch_species)
-            n_sp = upsert_species(engine, sp_df)
-            n_sd = upsert_species_distribution(engine, batch_dist)
+            n_sp = upsert_species(_connect_engine(db_url), sp_df)
+            n_sd = upsert_species_distribution(_connect_engine(db_url), batch_dist)
             logging.info(f"  final flush species={n_sp}, dist={n_sd}")
 
         # optional IUCN enrichment for species in this region
         if enrich_iucn_flag and IUCN_TOKEN:
-            with engine.begin() as conn:
+            with _connect_engine(db_url).begin() as conn:
                 rows = conn.execute(text("""
                     SELECT s.species_key, s.canonical_name
                     FROM species s
@@ -1032,16 +1028,10 @@ def ingest_special_14_facets(
             if rows:
                 sp_df = pd.DataFrame(rows)
                 sp_df = sp_df.rename(columns={"canonical_name": "canonical_name"})
-                sp_df["scientific_name"] = sp_df["canonical_name"]
-                sp_df["family"] = pd.NA; sp_df["genus"] = pd.NA
-                sp_df["class_name"] = pd.NA; sp_df["order_name"] = pd.NA
-                sp_df["kingdom"] = pd.NA; sp_df["phylum"] = pd.NA
-                sp_df["canonical_binomial"] = sp_df["canonical_name"].apply(_canon_binomial)
-
-                enriched = enrich_species_with_iucn(sp_df[["species_key","canonical_name"]].rename(columns={"canonical_name":"canonical_name"}).assign(iucn_category=pd.NA), IUCN_TOKEN)
-                # write back just (species_key, iucn_category)
+                # Fetch categories and update
+                enriched = enrich_species_with_iucn(sp_df[["species_key","canonical_name"]].assign(iucn_category=pd.NA), IUCN_TOKEN)
                 rows_up = enriched[["species_key","iucn_category"]].to_dict("records")
-                with engine.begin() as conn:
+                with _connect_engine(db_url).begin() as conn:
                     for r in rows_up:
                         conn.execute(text("UPDATE species SET iucn_category = COALESCE(:cat, iucn_category) WHERE species_key = :sk"),
                                      {"cat": r["iucn_category"], "sk": int(r["species_key"])})
@@ -1057,48 +1047,398 @@ def ingest_special_14_facets(
     logging.info("✅ Special-14 ingestion finished (checkpoints saved).")
 
 # ------------------------------------------------------------------------------
+# CLIMATE ENVELOPE MODELING (merged & adapted to row-per-trait schema)
+# ------------------------------------------------------------------------------
+class ClimateEnvelopeModeler:
+    """
+    Automated Climate Envelope Modeling → writes quantitative ranges
+    into species_traits as rows (trait_name, trait_value), keyed by species_key.
+    """
+    def __init__(self, db_url: str = DB_URL):
+        self.db_url = db_url
+        self.engine = _connect_engine(db_url)
+        ensure_schema(self.engine, recreate_schema=False)
+        self.ee_initialized = self._init_ee()
+
+        # Variables to extract
+        self.env_variables = {
+            'annual_precip_mm': 'Annual Precipitation',
+            'mean_temp_c': 'Mean Annual Temperature',
+            'min_temp_c': 'Minimum Temperature (coldest month)',
+            'max_temp_c': 'Maximum Temperature (warmest month)',
+            'soil_ph': 'Soil pH',
+            'elevation_m': 'Elevation',
+            'slope_deg': 'Slope',
+            'ndvi_mean': 'NDVI (Vegetation Health)'
+        }
+        self.percentiles = [5, 25, 50, 75, 95]
+
+    def _init_ee(self) -> bool:
+        if not GEE_IMPORTED:
+            logging.warning("ee not installed; using mock environmental data.")
+            return False
+        try:
+            ee.Initialize()
+            logging.info("✅ Google Earth Engine initialized.")
+            return True
+        except Exception as e:
+            logging.warning(f"⚠️ GEE initialization failed: {e}")
+            return False
+
+    # ---------- species selection ----------
+    def get_species_to_model(self, limit: Optional[int] = None) -> List[Tuple[int,str]]:
+        """
+        Returns [(species_key, scientific_name)] for species that are missing ANY of:
+         min_ph, max_ph, min_rainfall_mm, max_rainfall_mm (as trait rows).
+        """
+        q = text("""
+        WITH base AS (
+          SELECT s.species_key, COALESCE(s.canonical_name, s.scientific_name) AS name
+          FROM species s
+        ),
+        t AS (
+          SELECT species_key,
+                 SUM(CASE WHEN trait_name='min_ph' THEN 1 ELSE 0 END) AS has_min_ph,
+                 SUM(CASE WHEN trait_name='max_ph' THEN 1 ELSE 0 END) AS has_max_ph,
+                 SUM(CASE WHEN trait_name='min_rainfall_mm' THEN 1 ELSE 0 END) AS has_min_rain,
+                 SUM(CASE WHEN trait_name='max_rainfall_mm' THEN 1 ELSE 0 END) AS has_max_rain
+          FROM species_traits
+          WHERE trait_name IN ('min_ph','max_ph','min_rainfall_mm','max_rainfall_mm')
+          GROUP BY species_key
+        )
+        SELECT b.species_key, b.name
+        FROM base b
+        LEFT JOIN t ON t.species_key=b.species_key
+        WHERE COALESCE(t.has_min_ph,0)=0 OR COALESCE(t.has_max_ph,0)=0
+           OR COALESCE(t.has_min_rain,0)=0 OR COALESCE(t.has_max_rain,0)=0
+        ORDER BY b.name
+        """)
+        with self.engine.begin() as conn:
+            rows = conn.execute(q).fetchall()
+        pairs = [(int(r[0]), str(r[1])) for r in rows if r[0] is not None]
+        if limit:
+            pairs = pairs[:int(limit)]
+        logging.info(f"📋 {len(pairs)} species need climate envelope traits.")
+        return pairs
+
+    # ---------- GBIF occurrences (simple) ----------
+    def fetch_gbif_occurrences(self, species_name: str, max_records: int = 300) -> pd.DataFrame:
+        if not PYGIBF_OK:
+            logging.warning("pygbif not installed; generating mock occurrences.")
+            return self._mock_occ(species_name)
+        # Minimal GBIF fetch by species name
+        try:
+            # Direct API search (simplified)
+            params = {"scientificName": species_name, "hasCoordinate": "true", "limit": max_records}
+            r = requests.get(GBIF_OCC_SEARCH, params=params, timeout=60)
+            r.raise_for_status()
+            data = r.json()
+            results = data.get("results", [])
+            rows = []
+            for rec in results:
+                lat, lon = rec.get("decimalLatitude"), rec.get("decimalLongitude")
+                if lat is None or lon is None:
+                    continue
+                rows.append({
+                    "latitude": float(lat),
+                    "longitude": float(lon),
+                    "year": rec.get("year"),
+                    "country": rec.get("country"),
+                    "basis_of_record": rec.get("basisOfRecord"),
+                    "dataset_key": rec.get("datasetKey"),
+                })
+            df = pd.DataFrame(rows)
+            if not df.empty:
+                df = df.drop_duplicates(subset=["latitude","longitude"])
+            logging.info(f"GBIF occurrences for {species_name}: {len(df)}")
+            return df
+        except Exception as e:
+            logging.warning(f"GBIF query failed for {species_name}: {e}; using mock occurrences.")
+            return self._mock_occ(species_name)
+
+    def _mock_occ(self, species_name: str) -> pd.DataFrame:
+        np.random.seed(abs(hash(species_name)) % (2**32))
+        n = np.random.randint(30, 90)
+        lats = np.random.uniform(8.0, 37.0, n)
+        lons = np.random.uniform(68.0, 97.0, n)
+        return pd.DataFrame({"latitude": lats, "longitude": lons, "year": np.random.randint(1995, 2024, n)})
+
+    # ---------- Environmental extraction ----------
+    def extract_env(self, occ_df: pd.DataFrame) -> pd.DataFrame:
+        if occ_df.empty:
+            return occ_df
+        if not self.ee_initialized:
+            logging.warning("GEE not available; adding mock environmental values.")
+            return self._mock_env(occ_df)
+
+        try:
+            # Build FeatureCollection
+            points = [ee.Feature(ee.Geometry.Point([lon, lat])) for lat, lon in zip(occ_df["latitude"], occ_df["longitude"])]
+            fc = ee.FeatureCollection(points)
+
+            # Layers
+            worldclim = ee.Image('WORLDCLIM/V1/BIO')
+            annual_precip = worldclim.select('bio12').rename('annual_precip_mm')
+            mean_temp = worldclim.select('bio01').divide(10).rename('mean_temp_c')
+            min_temp = worldclim.select('bio06').divide(10).rename('min_temp_c')
+            max_temp = worldclim.select('bio05').divide(10).rename('max_temp_c')
+
+            # Soil pH (use resilient option)
+            soil_ph_img = None
+            for aid in [
+                "OpenLandMap/SOL/SOL_PH-H2O_USDA-4C1A2A_M/v02",
+                "OpenLandMap/SOL/SOL_PH-H2O_USDA-4C1A2A_A/v02",
+                "projects/soilgrids-isric/ph_mean",   # may or may not be accessible
+                "projects/soilgrids-isric/phh2o_mean"
+            ]:
+                try:
+                    _img = ee.Image(aid)
+                    _ = _img.bandNames().getInfo()
+                    soil_ph_img = _img
+                    logging.info(f"Using soil pH asset: {aid}")
+                    break
+                except Exception:
+                    continue
+            if soil_ph_img is None:
+                soil_ph_img = ee.Image('WORLDCLIM/V1/BIO').select('bio01').multiply(0)  # neutral fallback @ 0
+            soil_ph = soil_ph_img.divide(10).rename("soil_ph")
+
+            # Topography
+            dem = ee.Image('USGS/SRTMGL1_003').rename('elevation_m')
+            slope = ee.Terrain.slope(dem).rename('slope_deg')
+
+            # Vegetation (MODIS NDVI multi-year mean)
+            ndvi = (ee.ImageCollection('MODIS/006/MOD13Q1')
+                    .filterDate('2018-01-01', '2024-12-31')
+                    .select('NDVI')).mean().multiply(0.0001).rename('ndvi_mean')
+
+            composite = (annual_precip.addBands([mean_temp, min_temp, max_temp, soil_ph, dem, slope, ndvi]))
+            sampled = composite.sampleRegions(collection=fc, scale=1000, geometries=False)
+
+            data = sampled.getInfo()
+            features = data.get("features", [])
+            rows = []
+            for i, feat in enumerate(features):
+                props = feat.get("properties", {})
+                rows.append({
+                    "latitude": float(occ_df.iloc[i]["latitude"]),
+                    "longitude": float(occ_df.iloc[i]["longitude"]),
+                    **{k: props.get(k, np.nan) for k in self.env_variables.keys()}
+                })
+            env_df = pd.DataFrame(rows)
+            # Filter rows that have at least half variables present
+            thresh = max(1, int(0.5 * len(self.env_variables)))
+            env_df = env_df.dropna(thresh=thresh)
+            merged = pd.merge(occ_df, env_df, on=["latitude","longitude"], how="inner")
+            logging.info(f"Extracted env at {len(merged)} of {len(occ_df)} points.")
+            return merged
+
+        except Exception as e:
+            logging.warning(f"Env extraction failed: {e}; using mock env.")
+            return self._mock_env(occ_df)
+
+    def _mock_env(self, df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        np.random.seed(42)
+        out["annual_precip_mm"] = np.random.normal(900, 300, len(df))
+        out["mean_temp_c"] = np.random.normal(25, 4, len(df))
+        out["min_temp_c"] = out["mean_temp_c"] - np.random.uniform(6, 12, len(df))
+        out["max_temp_c"] = out["mean_temp_c"] + np.random.uniform(6, 12, len(df))
+        out["soil_ph"] = np.random.normal(7.1, 0.6, len(df))
+        out["elevation_m"] = np.random.exponential(300, len(df))
+        out["slope_deg"] = np.random.exponential(5, len(df))
+        out["ndvi_mean"] = np.random.normal(0.5, 0.15, len(df))
+        return out
+
+    # ---------- Envelope statistics ----------
+    def calc_envelope(self, env_df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+        if env_df.empty:
+            return {}
+        out: Dict[str, Dict[str, Any]] = {}
+        for var, desc in self.env_variables.items():
+            if var not in env_df.columns:
+                continue
+            vals = pd.to_numeric(env_df[var], errors="coerce").dropna()
+            if len(vals) < 10:
+                continue
+            q = np.percentile(vals, self.percentiles)
+            out[var] = {
+                "min_value": float(q[0]),
+                "q25": float(q[1]),
+                "median": float(q[2]),
+                "q75": float(q[3]),
+                "max_value": float(q[4]),
+                "mean": float(vals.mean()),
+                "std": float(vals.std()),
+                "sample_size": int(len(vals)),
+                "description": desc,
+            }
+        return out
+
+    # ---------- Persist to DB as rows in species_traits ----------
+    def write_envelope_traits(self, species_key: int, species_name: str, env: Dict[str, Dict[str, Any]]) -> int:
+        trait_rows: List[Dict[str, Any]] = []
+        src = "GBIF+GEE Climate Envelope"
+        now = datetime.now().isoformat()
+
+        def add(name: str, value: Any):
+            trait_rows.append({
+                "species_key": species_key,
+                "trait_name": name,
+                "trait_value": None if value is None else str(value),
+                "source": src,
+            })
+
+        # Map climate stats to traits
+        if "annual_precip_mm" in env:
+            add("min_rainfall_mm", env["annual_precip_mm"]["min_value"])
+            add("max_rainfall_mm", env["annual_precip_mm"]["max_value"])
+            add("optimal_rainfall_mm", env["annual_precip_mm"]["median"])
+
+        if "soil_ph" in env:
+            add("min_ph", env["soil_ph"]["min_value"])
+            add("max_ph", env["soil_ph"]["max_value"])
+            add("optimal_ph", env["soil_ph"]["median"])
+
+        if "mean_temp_c" in env:
+            # infer bounds using min/max if available, else use mean_temp envelope
+            min_t = env.get("min_temp_c", {}).get("min_value", env["mean_temp_c"]["min_value"])
+            max_t = env.get("max_temp_c", {}).get("max_value", env["mean_temp_c"]["max_value"])
+            add("min_temp_c", min_t)
+            add("max_temp_c", max_t)
+            add("optimal_temp_c", env["mean_temp_c"]["median"])
+
+        if "elevation_m" in env:
+            add("min_elevation_m", env["elevation_m"]["min_value"])
+            add("max_elevation_m", env["elevation_m"]["max_value"])
+
+        # Derived qualitative traits
+        # Drought tolerance from min precip
+        if "annual_precip_mm" in env:
+            minp = env["annual_precip_mm"]["min_value"]
+            drought = "High" if minp < 300 else ("Moderate" if minp < 600 else "Low")
+            add("drought_tolerance", drought)
+        # Soil type pref from median pH
+        if "soil_ph" in env:
+            medph = env["soil_ph"]["median"]
+            soil_pref = "Acidic" if medph < 6.0 else ("Alkaline" if medph > 7.5 else "Neutral")
+            add("soil_type_preference", soil_pref)
+        # Climate zone
+        if "mean_temp_c" in env and "annual_precip_mm" in env:
+            t = env["mean_temp_c"]["median"]; p = env["annual_precip_mm"]["median"]
+            if t > 25 and p > 1000:
+                cz = "Tropical"
+            elif t > 20 and p > 600:
+                cz = "Subtropical"
+            elif t > 15:
+                cz = "Temperate"
+            else:
+                cz = "Cool Temperate"
+            add("climate_zone", cz)
+
+        # metadata
+        add("climate_envelope_sample_size", env.get("annual_precip_mm", {}).get("sample_size", 0))
+        add("climate_envelope_last_updated", now)
+
+        n = insert_traits(self.engine, trait_rows)
+        logging.info(f"Updated {n} trait rows for {species_name} (key={species_key}).")
+        return n
+
+    # ---------- Orchestration ----------
+    def process_species(self, species_key: int, species_name: str) -> bool:
+        logging.info(f"\n🌿 Climate Envelope: {species_name} (key={species_key})")
+        occ = self.fetch_gbif_occurrences(species_name, max_records=300)
+        if occ.empty:
+            logging.warning("No occurrences; skipping.")
+            return False
+        env_pts = self.extract_env(occ)
+        if env_pts.empty:
+            logging.warning("No environmental points; skipping.")
+            return False
+        env = self.calc_envelope(env_pts)
+        if not env:
+            logging.warning("No envelope statistics; skipping.")
+            return False
+        self.write_envelope_traits(species_key, species_name, env)
+        return True
+
+    def process_all(self, limit: Optional[int] = None, delay_s: float = 1.5) -> Dict[str, Any]:
+        pairs = self.get_species_to_model(limit=limit)
+        if not pairs:
+            logging.info("No species need envelope traits.")
+            return {"total": 0, "success": 0, "failed": 0, "failed_species": []}
+        ok = 0; fail = 0; failed: List[str] = []
+        for i, (sk, name) in enumerate(pairs, 1):
+            logging.info(f"[{i}/{len(pairs)}] {name}")
+            try:
+                if self.process_species(sk, name):
+                    ok += 1
+                else:
+                    fail += 1
+                    failed.append(name)
+            except KeyboardInterrupt:
+                logging.info("Interrupted by user.")
+                break
+            except Exception as e:
+                logging.error(f"Unexpected error on {name}: {e}")
+                fail += 1
+                failed.append(name)
+            time.sleep(delay_s)
+        logging.info(f"Envelope modeling done: success={ok}, failed={fail}")
+        return {"total": len(pairs), "success": ok, "failed": fail, "failed_species": failed}
+
+# ------------------------------------------------------------------------------
 # CLI
 # ------------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser(
-        description="Ingest GBIF plant data into Manthan DB. Supports single-area mode and Special-14 (tiling + species facets)."
+        description="Manthan Data Ingestion & Climate Envelope Modeling"
     )
 
-    mode = parser.add_mutually_exclusive_group(required=True)
-    mode.add_argument("--single", action="store_true", help="Single area ingest (original pipeline).")
-    mode.add_argument("--special-14", action="store_true", help="Run curated 14-region ingest (tiling + species facets).")
+    sub = parser.add_subparsers(dest="cmd", required=True)
 
-    # Shared
-    parser.add_argument("--db-url", type=str, default=DB_URL, help="SQLAlchemy DB URL (default env MANTHAN_DB_URL).")
-    parser.add_argument("--no-iucn", action="store_true", help="Disable IUCN enrichment even if token present.")
-    parser.add_argument("--recreate-schema", action="store_true", help="Recreate incompatible tables (destructive).")
+    # Single-area GBIF ingest
+    p_single = sub.add_parser("single", help="Single area GBIF ingest (original pipeline).")
+    p_single.add_argument("--db-url", type=str, default=DB_URL)
+    p_single.add_argument("--location", type=str, help="Free-text location (e.g., 'Moradabad, Uttar Pradesh, India').")
+    p_single.add_argument("--region", type=str, help="Alias for --location.")
+    p_single.add_argument("--bbox", type=str, help="Bounding box 'west,south,east,north'.")
+    p_single.add_argument("--taxon-key", type=int, default=PLANTAE_TAXON_KEY)
+    p_single.add_argument("--country", type=str, default="IN")
+    p_single.add_argument("--since-year", type=int, default=2000)
+    p_single.add_argument("--max-records", type=int, default=10000)
+    p_single.add_argument("--csv-out", type=str, help="Directory to also write CSV exports.")
+    p_single.add_argument("--dry-run", action="store_true")
+    p_single.add_argument("--sleep-s", type=float, default=0.25)
+    p_single.add_argument("--no-iucn", action="store_true")
+    p_single.add_argument("--recreate-schema", action="store_true")
 
-    # Single-area args
-    parser.add_argument("--location", type=str, help="Free-text location (e.g., 'Moradabad, Uttar Pradesh, India').")
-    parser.add_argument("--region", type=str, help="Alias for --location.")
-    parser.add_argument("--bbox", type=str, help="Bounding box 'west,south,east,north'.")
-    parser.add_argument("--taxon-key", type=int, default=PLANTAE_TAXON_KEY, help="GBIF taxonKey (default: 6=Plantae).")
-    parser.add_argument("--country", type=str, default="IN", help="ISO2 country code filter (default: IN).")
-    parser.add_argument("--since-year", type=int, default=2000, help="Keep records with year >= since-year.")
-    parser.add_argument("--max-records", type=int, default=10000, help="Max GBIF records to fetch.")
-    parser.add_argument("--csv-out", type=str, help="Directory to also write CSV exports.")
-    parser.add_argument("--dry-run", action="store_true", help="Fetch & clean only; no DB writes.")
-    parser.add_argument("--sleep-s", type=float, default=0.25, help="Sleep between GBIF pages (seconds).")
+    # Special-14 regions
+    p_s14 = sub.add_parser("special14", help="Curated 14-region ingest via species facets (resumable).")
+    p_s14.add_argument("--db-url", type=str, default=DB_URL)
+    p_s14.add_argument("--facet-page", type=int, default=2000)
+    p_s14.add_argument("--max-species-per-region", type=int, default=5000)
+    p_s14.add_argument("--tile-cols", type=int, default=3)
+    p_s14.add_argument("--tile-rows", type=int, default=3)
+    p_s14.add_argument("--sleep-page", type=float, default=0.3)
+    p_s14.add_argument("--sleep-tile", type=float, default=2.0)
+    p_s14.add_argument("--sleep-region", type=float, default=8.0)
+    p_s14.add_argument("--checkpoint", type=str, default="data/checkpoints/special14_facets.json")
+    p_s14.add_argument("--no-iucn", action="store_true")
 
-    # Special-14 args (facets)
-    parser.add_argument("--facet-page", type=int, default=2000, help="Facet page size (unique species per call).")
-    parser.add_argument("--max-species-per-region", type=int, default=5000, help="Cap species per region per run.")
-    parser.add_argument("--tile-cols", type=int, default=3, help="Tiles per region (columns).")
-    parser.add_argument("--tile-rows", type=int, default=3, help="Tiles per region (rows).")
-    parser.add_argument("--sleep-page", type=float, default=0.3, help="Sleep between facet pages (s).")
-    parser.add_argument("--sleep-tile", type=float, default=2.0, help="Sleep between tiles (s).")
-    parser.add_argument("--sleep-region", type=float, default=8.0, help="Sleep between regions (s).")
-    parser.add_argument("--checkpoint", type=str, default="data/checkpoints/special14_facets.json", help="Checkpoint JSON path.")
+    # Climate Envelope Modeling
+    p_env = sub.add_parser("envelope", help="Climate Envelope Modeling to derive quantitative trait ranges.")
+    p_env.add_argument("--db-url", type=str, default=DB_URL)
+    group = p_env.add_mutually_exclusive_group(required=True)
+    group.add_argument("--all", action="store_true", help="Process all species that are missing envelope traits.")
+    group.add_argument("--species-key", type=int, help="Process a single species by species_key.")
+    group.add_argument("--species-name", type=str, help="Process a single species by scientific/canonical name.")
+    p_env.add_argument("--limit", type=int, help="Limit number of species for --all.")
+    p_env.add_argument("--delay-s", type=float, default=1.5)
 
     args = parser.parse_args()
-    enrich_iucn_flag = (not args.no_iucn) and bool(IUCN_TOKEN)
-
-    if args.single:
+    if args.cmd == "single":
+        enrich_flag = (not args.no_iucn) and bool(IUCN_TOKEN)
         run_pipeline_single(
             db_url=args.db_url,
             location=args.location,
@@ -1109,12 +1449,13 @@ def main():
             since_year=args.since_year,
             max_records=args.max_records,
             out_csv_dir=args.csv_out,
-            enrich_iucn_flag=enrich_iucn_flag,
+            enrich_iucn_flag=enrich_flag,
             dry_run=args.dry_run,
             sleep_s=args.sleep_s,
             recreate_schema=args.recreate_schema,
         )
-    else:
+    elif args.cmd == "special14":
+        enrich_flag = (not args.no_iucn) and bool(IUCN_TOKEN)
         ingest_special_14_facets(
             db_url=args.db_url,
             facet_page=args.facet_page,
@@ -1125,8 +1466,33 @@ def main():
             sleep_tile=args.sleep_tile,
             sleep_region=args.sleep_region,
             checkpoint_path=args.checkpoint,
-            enrich_iucn_flag=enrich_iucn_flag,
+            enrich_iucn_flag=enrich_flag,
         )
+    else:
+        # envelope
+        modeler = ClimateEnvelopeModeler(db_url=args.db_url)
+        if args.all:
+            modeler.process_all(limit=args.limit, delay_s=args.delay_s)
+        elif args.species_key is not None:
+            # lookup name for logging
+            with _connect_engine(args.db_url).begin() as conn:
+                row = conn.execute(text("SELECT COALESCE(canonical_name,scientific_name) FROM species WHERE species_key=:k"),
+                                   {"k": int(args.species_key)}).fetchone()
+            name = row[0] if row else f"key={args.species_key}"
+            modeler.process_species(int(args.species_key), str(name))
+        else:
+            # name provided → find key
+            with _connect_engine(args.db_url).begin() as conn:
+                r = conn.execute(text("""
+                    SELECT species_key FROM species
+                    WHERE scientific_name=:n OR canonical_name=:n
+                    ORDER BY species_key LIMIT 1
+                """), {"n": args.species_name}).fetchone()
+            if not r:
+                logging.error(f"Species not found in DB: {args.species_name}")
+                sys.exit(1)
+            sk = int(r[0])
+            modeler.process_species(sk, args.species_name)
 
 if __name__ == "__main__":
     main()

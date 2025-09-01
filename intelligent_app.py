@@ -1,686 +1,603 @@
 # intelligent_app.py
 from __future__ import annotations
 
-import json
+# --- macOS OpenMP workaround (put FIRST; dev only) ---
+import os as _os
+_os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+_os.environ.setdefault("OMP_NUM_THREADS", "1")
+_os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 import os
 import sys
-from dataclasses import dataclass
+import logging
+import sqlite3
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
+from PIL import Image
 
-# Optional geo/map deps (all gracefully optional)
+# Requests is optional (used for direct GEE download URL)
 try:
-    import leafmap.foliumap as leafmap
-    _LEAFMAP_OK = True
+    import requests
 except Exception:
-    leafmap = None
-    _LEAFMAP_OK = False
+    requests = None
 
-try:
-    import folium
-    from streamlit_folium import st_folium
-    _FOLIUM_OK = True
-except Exception:
-    folium = None
-    st_folium = None
-    _FOLIUM_OK = False
+# Google Earth Engine
+import ee
 
-try:
-    import rasterio
-except Exception:
-    rasterio = None
+# ---------------- Paths & Logging ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Optional Earth Engine (for water balance + JRC water overlay)
-try:
-    import ee
-    _EE_IMPORTED = True
-except Exception:
-    ee = None
-    _EE_IMPORTED = False
-
-# ------------------------------------------------------------------------------
-# Bootstrap import path for local packages
-# ------------------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-# ------------------------------------------------------------------------------
-# Core Manthan imports (defensive)
-# ------------------------------------------------------------------------------
-RECOMMENDER_OK = True
-MODEL_RUNNER_OK = True
-DB_OK = True
-
-try:
-    from manthan_core.recommender.intelligent_recommender import IntelligentRecommender
-except Exception as e:
-    RECOMMENDER_OK = False
-    _RECOMMENDER_IMPORT_ERR = e
-
-try:
-    from manthan_core.utils.model_runner import run_resnet_inference, run_unet_inference
-except Exception as e:
-    MODEL_RUNNER_OK = False
-    _MODEL_RUNNER_IMPORT_ERR = e
-
-try:
-    from manthan_core.utils.db_connector import KnowledgeBase
-except Exception as e:
-    DB_OK = False
-    _DB_IMPORT_ERR = e
-
-# ------------------------------------------------------------------------------
-# Streamlit base config
-# ------------------------------------------------------------------------------
+# ---------------- Config ----------------
 st.set_page_config(page_title="Manthan: Living Forest Intelligence", layout="wide")
 st.title("🌱 Manthan: Living Forest Intelligence")
 
-# ------------------------------------------------------------------------------
-# Config / Paths (env-overridable)
-# ------------------------------------------------------------------------------
-DB_URL = os.getenv("MANTHAN_DB_URL", f"sqlite:///{REPO_ROOT}/data/manthan.db")
-EMBEDDINGS_DIR = Path(os.getenv("MANTHAN_EMBEDDINGS_DIR", str(REPO_ROOT / "data/embeddings")))
-RESNET_MODEL_PATH = Path(os.getenv("MANTHAN_RESNET_MODEL", str(REPO_ROOT / "models/artifacts/resnet34_pan_india_weights.pth")))
-UNET_MODEL_PATH = Path(os.getenv("MANTHAN_UNET_MODEL", str(REPO_ROOT / "models/artifacts/unet_pan_india_final_v1.pth")))
-RESNET_NUM_CLASSES = int(os.getenv("MANTHAN_RESNET_CLASSES", "12"))
-UNET_NUM_CLASSES = int(os.getenv("MANTHAN_UNET_CLASSES", "3"))
+DB_URL = os.getenv("MANTHAN_DB_URL", "sqlite:///data/manthan.db")
+EMBEDDINGS_DIR = REPO_ROOT / "data" / "embeddings"
+RESNET_MODEL_PATH = REPO_ROOT / "models" / "artifacts" / "resnet34_pan_india_weights.pth"
+UNET_MODEL_PATH   = REPO_ROOT / "models" / "artifacts" / "unet_pan_india_final_v1.pth"
 
-# ------------------------------------------------------------------------------
-# Initialize Earth Engine (best-effort)
-# ------------------------------------------------------------------------------
-_EE_OK = False
-if _EE_IMPORTED:
-    try:
-        # If user has set GOOGLE_APPLICATION_CREDENTIALS or has authenticated locally
-        ee.Initialize()
-        _EE_OK = True
-    except Exception:
-        # Leave as False; we’ll surface a gentle tip in Diagnostics
-        _EE_OK = False
+# Placeholder images for UI if inference is skipped/unavailable
+PLACEHOLDER_RESNET_IMG = REPO_ROOT / "assets" / "placeholder_resnet_map.png"
+PLACEHOLDER_UNET_IMG   = REPO_ROOT / "assets" / "placeholder_unet_map.png"
 
-# ------------------------------------------------------------------------------
-# Sidebar — Stage 1: INPUT (Profile → Priorities, AOI, Site file)
-# ------------------------------------------------------------------------------
-st.sidebar.header("1) Who are you?")
-profile = st.sidebar.selectbox(
-    "Select your profile to set project priorities:",
-    ["Select a profile...", "Farmer (Agroforestry)", "NGO / Government (Ecological Restoration)", "Corporate (Carbon Credits)"],
+# AOI raster (download target) + quicklook paths
+INFER_DIR = REPO_ROOT / "data" / "inference"
+AOI_TIF_PATH = INFER_DIR / "current_aoi.tif"
+RESNET_PNG = INFER_DIR / "resnet_quicklook.png"
+UNET_PNG   = INFER_DIR / "unet_quicklook.png"
+
+# ---------------- Core Manthan Imports ----------------
+from manthan_core.recommender.intelligent_recommender import IntelligentRecommender
+from manthan_core.utils.model_runner import run_resnet_inference, run_unet_inference
+from manthan_core.site_assessment.gee_pipeline import (
+    get_site_fingerprint,
+    download_aoi_as_geotiff,  # placeholder-friendly fallback
 )
+from manthan_core.utils.db_connector import KnowledgeBase
 
-priorities: Dict[str, str] = {}
-if profile == "Farmer (Agroforestry)":
-    priorities = {"primary": "short_term_economic_returns", "secondary": "food_production"}
-    st.sidebar.info("Goal: Maximize early-stage income from NTFPs and edible plants.")
-elif profile == "NGO / Government (Ecological Restoration)":
-    priorities = {"primary": "biodiversity_uplift", "secondary": "threatened_species"}
-    st.sidebar.info("Goal: Maximize native biodiversity and prioritize endangered species.")
-elif profile == "Corporate (Carbon Credits)":
-    priorities = {"primary": "carbon_sequestration", "secondary": "fast_growth_rate"}
-    st.sidebar.info("Goal: Maximize carbon capture potential.")
-
-st.sidebar.header("2) Where is your land?")
-# AOI selection: draw on map OR upload/paste GeoJSON
-aoi_geojson: Optional[Dict[str, Any]] = None
-
-if _LEAFMAP_OK:
-    m = leafmap.Map(center=[22.5, 79.0], zoom=5, draw_export=True)
-    m.add_basemap("HYBRID")
-    m.add_draw_control(export=False)
-    st.sidebar.markdown("Draw a polygon on the map, then click **Use drawn AOI** below.")
-    aoi_container = st.sidebar.empty()
-else:
-    st.sidebar.warning("leafmap not available; falling back to basic GeoJSON inputs.")
-
-uploaded_geojson = st.sidebar.file_uploader("…or upload AOI GeoJSON", type=["geojson", "json"])
-aoi_text = st.sidebar.text_area("…or paste AOI GeoJSON", height=120)
-
-use_drawn = False
-if _LEAFMAP_OK:
-    st.sidebar.button("Use drawn AOI", key="use_drawn_btn")
-    # Leafmap keeps drawn features in m.user_roi (Polygon) or m.user_rois
-    if "use_drawn_btn" in st.session_state:
-        use_drawn = True
-
-if _LEAFMAP_OK:
-    with st.sidebar.expander("Map (zoom & draw AOI)", expanded=True):
-        m.to_streamlit(height=320)
-
-# Resolve AOI from sources (priority: drawn > upload > pasted)
-if _LEAFMAP_OK and use_drawn:
+# ---------------- EE init (quiet) ----------------
+def _init_ee() -> str:
+    project = os.getenv("EE_PROJECT_ID", "manthan-466509")
     try:
-        geom = m.user_roi or (m.user_rois[0] if m.user_rois else None)
-        if geom is not None:
-            aoi_geojson = json.loads(geom.to_geojson())
+        ee.Initialize(project=project)
     except Exception:
-        aoi_geojson = None
+        try:
+            ee.Authenticate()
+            ee.Initialize(project=project)
+        except Exception as e:
+            logging.warning(f"Earth Engine init skipped (auth not available now): {e}")
+    return project
 
-if aoi_geojson is None and uploaded_geojson is not None:
-    try:
-        aoi_geojson = json.loads(uploaded_geojson.getvalue().decode("utf-8"))
-    except Exception:
-        st.sidebar.error("Uploaded AOI is not valid GeoJSON.")
+ee_project = _init_ee()
 
-if aoi_geojson is None and aoi_text.strip():
-    try:
-        aoi_geojson = json.loads(aoi_text)
-    except Exception:
-        st.sidebar.error("Pasted AOI is not valid GeoJSON.")
+# ---------------- Health checks ----------------
+def _sqlite_path_from_url(db_url: str) -> Path:
+    return Path(db_url.replace("sqlite:///", "", 1)) if db_url.startswith("sqlite:///") else Path(db_url)
 
-st.sidebar.header("3) Site analysis inputs")
-uploaded_tif = st.sidebar.file_uploader("Upload site GeoTIFF (optional)", type=["tif", "tiff"])
-site_path_text = st.sidebar.text_input("…or path to GeoTIFF on disk", str(REPO_ROOT / "data/input/sample_aoi.tif"))
+db_ok     = _sqlite_path_from_url(DB_URL).exists()
+index_ok  = all((EMBEDDINGS_DIR / f).exists() for f in ("faiss.index", "embeddings.npy", "items.json"))
+resnet_ok = RESNET_MODEL_PATH.exists()
+unet_ok   = UNET_MODEL_PATH.exists()
 
-st.sidebar.header("4) Models")
-use_unet = st.sidebar.checkbox("Run U-Net (suitability map)", True)
-use_resnet = st.sidebar.checkbox("Run ResNet (site quality)", False)
+with st.sidebar:
+    st.header("🧠 Knowledge Base Health")
+    st.write(f"Database: {'✅ Found' if db_ok else '❌ Not Found'}")
+    st.write(f"Semantic Index: {'✅ Found' if index_ok else '❌ Not Found'}")
+    st.write(f"ResNet Model: {'✅ Found' if resnet_ok else '❌ Not Found'}")
+    st.write(f"U-Net Model: {'✅ Found' if unet_ok else '❌ Not Found'}")
+    st.caption(f"EE Project: `{ee_project}`")
 
-st.sidebar.header("5) Goal prompt")
-goal_query = st.sidebar.text_area(
-    "Describe your restoration goal",
-    "A drought-tolerant, fast-growing forest with high biodiversity for the Uttar Pradesh plains.",
-    height=80,
-)
-
-run_clicked = st.sidebar.button("🚀 Generate Plan", type="primary")
-
-# ------------------------------------------------------------------------------
-# Utilities
-# ------------------------------------------------------------------------------
-def _file_from_uploader(upl) -> Optional[Path]:
-    if upl is None:
-        return None
-    out_dir = REPO_ROOT / ".streamlit_cache" / "uploads"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / upl.name
-    with open(out_path, "wb") as f:
-        f.write(upl.getbuffer())
-    return out_path
-
-def _resolve_site_path(text_path: str, upload) -> Optional[Path]:
-    if upload is not None:
-        return _file_from_uploader(upload)
-    p = Path(text_path).expanduser()
-    return p if p.exists() else None
-
-def _rgb_preview(path: Path, max_px: int = 900) -> Optional[np.ndarray]:
-    if rasterio is None:
-        return None
-    try:
-        with rasterio.open(path) as ds:
-            bands = [1, 2, 3] if ds.count >= 3 else [1]
-            img = ds.read(bands)  # (B,H,W)
-            img = np.moveaxis(img, 0, -1).astype(np.float32)  # (H,W,B)
-            if img.size == 0:
-                return None
-            eps = 1e-6
-            mn = img.min(axis=(0, 1), keepdims=True)
-            mx = img.max(axis=(0, 1), keepdims=True)
-            img = (img - mn) / (mx - mn + eps)
-            img = (img * 255).clip(0, 255).astype(np.uint8)
-            h, w = img.shape[:2]
-            scale = max(h, w) / float(max_px)
-            if scale > 1:
-                new_h, new_w = int(h / scale), int(w / scale)
-                try:
-                    import cv2
-                    img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                except Exception:
-                    from PIL import Image
-                    img = np.array(Image.fromarray(img).resize((new_w, new_h), Image.BILINEAR))
-            return img
-    except Exception:
-        return None
-
-# ------------------------------------------------------------------------------
-# Cached resources
-# ------------------------------------------------------------------------------
+# ---------------- Load components (independently cached) ----------------
 @st.cache_resource(show_spinner=False)
-def load_intelligence(db_url: str, embeddings_dir: Path):
-    kb = None
-    if DB_OK:
-        try:
-            kb = KnowledgeBase(db_url)
-        except Exception as e:
-            st.warning(f"DB unavailable: {e}")
-    else:
-        st.warning(f"DB module missing: {repr(_DB_IMPORT_ERR)}")
+def get_kb():
+    try:
+        return KnowledgeBase(DB_URL)
+    except Exception as e:
+        logging.error(f"Failed to create KnowledgeBase: {e}")
+        return None
 
-    recommender = None
-    if RECOMMENDER_OK:
-        try:
-            try:
-                recommender = IntelligentRecommender(embeddings_dir, kb=kb)
-            except TypeError:
-                recommender = IntelligentRecommender(embeddings_dir)
-        except Exception as e:
-            st.error(f"Recommender init failed: {e}")
-    else:
-        st.error(f"Recommender module missing: {repr(_RECOMMENDER_IMPORT_ERR)}")
+@st.cache_resource(show_spinner=False)
+def get_recommender():
+    if not index_ok:
+        return None
+    try:
+        return IntelligentRecommender(EMBEDDINGS_DIR)
+    except Exception as e:
+        logging.info(f"Semantic recommender disabled: {e}")
+        return None
 
-    return recommender, kb
+kb = get_kb()
+recommender = get_recommender()
 
-recommender, kb = load_intelligence(DB_URL, EMBEDDINGS_DIR)
+if kb is None:
+    st.error("Database connection failed. Please ensure data/manthan.db exists and is accessible.")
+    st.stop()
 
-# ------------------------------------------------------------------------------
-# Analysis Engine — Stage 2: ANALYSIS
-# ------------------------------------------------------------------------------
-@dataclass
-class SiteFingerprint:
-    rainfall_mm: Optional[float] = None
-    pet_mm: Optional[float] = None
-    water_balance_mm: Optional[float] = None
-    biodiversity_baseline_count: Optional[int] = None
-    notes: List[str] = None
+# ---------------- Sidebar Inputs ----------------
+with st.sidebar:
+    st.header("1. Your Goal")
+    goal_query = st.text_area(
+        "Describe your restoration goal:",
+        "A drought-tolerant, fast-growing forest with high biodiversity for the plains of Uttar Pradesh."
+    )
 
-class AnalysisEngine:
-    def __init__(self, kb: Optional[KnowledgeBase], recommender: Optional[IntelligentRecommender]):
-        self.kb = kb
-        self.rec = recommender
+    st.header("2. Your Land")
+    aoi_input_str = st.text_input("Area of Interest (lon1,lat1,lon2,lat2):", "78.10,27.50,78.11,27.51")
 
-    # ---------- A) Enhanced Site Fingerprint ----------
-    def site_fingerprint(self, aoi_geojson: Dict[str, Any]) -> SiteFingerprint:
-        notes: List[str] = []
-        rainfall = pet = water_balance = None
-        bio_count = None
+    st.header("3. Species Filtering")
+    strictness = st.selectbox(
+        "Filter strictness",
+        ["Balanced", "Strict", "Soft"],
+        index=0,
+        help="Strict removes species outside pH/rainfall ranges. Soft keeps near misses with penalty."
+    )
+    min_compat = st.slider("Minimum environmental compatibility", 0.0, 1.0, 0.4, 0.05)
 
-        if _EE_OK and ee is not None:
-            try:
-                geom = ee.Geometry(aoi_geojson)
-                # CHIRPS last 12 months precipitation (mm)
-                chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterDate(ee.Date.now().advance(-12, "month"), ee.Date.now())
-                prcp = chirps.sum().rename("prcp_12mo")
+    st.header("4. AOI Raster for Inference")
+    st.caption("The app will try to download a Sentinel-2 RGB to `data/inference/current_aoi.tif`.")
 
-                # MOD16A2 ET (mm/8day); approx PET proxy over 12 months
-                mod16 = ee.ImageCollection("MODIS/061/MOD16A2").filterDate(ee.Date.now().advance(-12, "month"), ee.Date.now())
-                et = mod16.select("ET").sum().rename("pet_12mo")
+    run_clicked = st.button("Generate Plan", type="primary")
 
-                # Reduce to mean over AOI
-                pr_val = prcp.reduceRegion(ee.Reducer.mean(), geom, 1000).get("prcp_12mo")
-                et_val = et.reduceRegion(ee.Reducer.mean(), geom, 1000).get("pet_12mo")
-                rainfall = float(pr_val.getInfo()) if pr_val else None
-                pet = float(et_val.getInfo()) if et_val else None
-                if rainfall is not None and pet is not None:
-                    water_balance = rainfall - pet
-            except Exception as e:
-                notes.append(f"EE extraction failed: {e}")
+# ---------------- DB utilities for fallbacks & stats ----------------
+def _get_all_species_df(db_url: str) -> pd.DataFrame:
+    p = _sqlite_path_from_url(db_url)
+    if not p.exists():
+        return pd.DataFrame(columns=["species_key", "scientific_name", "canonical_name"])
+    conn = sqlite3.connect(str(p))
+    try:
+        return pd.read_sql("SELECT species_key, scientific_name, canonical_name FROM species", conn)
+    finally:
+        conn.close()
+
+def _get_all_traits_df(db_url: str) -> pd.DataFrame:
+    p = _sqlite_path_from_url(db_url)
+    if not p.exists():
+        return pd.DataFrame(columns=["species_key", "trait_name", "trait_value"])
+    conn = sqlite3.connect(str(p))
+    try:
+        return pd.read_sql("SELECT species_key, trait_name, trait_value FROM species_traits", conn)
+    finally:
+        conn.close()
+
+# ---------------- AOI download (real attempt via signed URL) ----------------
+def try_real_aoi_download(aoi: ee.Geometry, out_path: Path, scale: int = 10) -> bool:
+    """
+    Try to fetch a real Sentinel-2 RGB GeoTIFF using a signed EE download URL.
+    Falls back to False if requests is unavailable or any error occurs.
+    """
+    if requests is None:
+        return False
+    try:
+        s2 = (
+            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+            .filterBounds(aoi)
+            .filterDate("2023-01-01", "2024-12-31")
+            .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
+            .median()
+            .select(["B4","B3","B2"])
+            .multiply(0.0001)
+            .clip(aoi)
+        )
+        region = aoi.coordinates().getInfo()
+        params = {
+            "scale": scale,
+            "crs": "EPSG:4326",
+            "region": region,
+            "format": "GEO_TIFF",
+        }
+        url = s2.getDownloadURL(params)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with requests.get(url, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            with open(out_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+        logging.info(f"Downloaded AOI GeoTIFF to {out_path}")
+        return True
+    except Exception as e:
+        logging.warning(f"Real AOI download failed: {e}")
+        return False
+
+# ---------------- Quicklook helpers ----------------
+def _save_labelmap_png(arr: np.ndarray, out_png: Path) -> None:
+    """Save a label map (HxW uint8) as a PNG grayscale for quicklook."""
+    try:
+        im = Image.fromarray(arr.astype(np.uint8), mode="L")
+        out_png.parent.mkdir(parents=True, exist_ok=True)
+        im.save(out_png)
+    except Exception as e:
+        logging.warning(f"Failed to save quicklook {out_png.name}: {e}")
+
+# ---------------- Synonym-aware micro filter ----------------
+PH_MIN_KEYS   = ["min_ph", "ph_min", "soil_ph_min", "ph_low"]
+PH_MAX_KEYS   = ["max_ph", "ph_max", "soil_ph_max", "ph_high"]
+RAIN_MIN_KEYS = ["min_rain_mm", "min_precip_mm", "rain_min_mm", "rainfall_min_mm", "precip_min_mm"]
+RAIN_MAX_KEYS = ["max_rain_mm", "max_precip_mm", "rain_max_mm", "rainfall_max_mm", "precip_max_mm"]
+TEMP_MIN_KEYS = ["min_temp_c", "temp_min_c", "tmin_c"]
+TEMP_MAX_KEYS = ["max_temp_c", "temp_max_c", "tmax_c"]
+CANOPY_KEYS   = ["canopy_layer", "strata", "growth_form"]
+
+def _coerce_float(x: Any) -> Optional[float]:
+    try:
+        s = str(x).strip()
+        if s == "" or s.lower() in {"none","nan","null"}:
+            return None
+        return float(s)
+    except Exception:
+        return None
+
+def _first_num(traits: Dict[str, Any], keys: List[str]) -> Optional[float]:
+    for k in keys:
+        if k in traits:
+            v = _coerce_float(traits[k])
+            if v is not None:
+                return v
+    return None
+
+def _first_text(traits: Dict[str, Any], keys: List[str], default="Unknown") -> str:
+    for k in keys:
+        v = traits.get(k)
+        if v:
+            return str(v)
+    return default
+
+def apply_environmental_filter(species_list: List[str], site_conditions: Dict[str, Any], kb: KnowledgeBase,
+                               min_compat: float = 0.4) -> List[Dict[str, Any]]:
+    """Return a list of {'species','compatibility_score','traits','canopy_layer','rationale'} sorted by score."""
+    trait_map = kb.get_species_traits(species_list)  # {species: {trait_name: trait_value}}
+    site_ph   = _coerce_float(site_conditions.get("soil_ph"))
+    site_rain = _coerce_float(site_conditions.get("annual_precip_mm"))
+    site_tmp  = _coerce_float(site_conditions.get("mean_temp_c"))
+
+    out = []
+    for sp in species_list:
+        traits = trait_map.get(sp, {}) or {}
+        min_ph = _first_num(traits, PH_MIN_KEYS)
+        max_ph = _first_num(traits, PH_MAX_KEYS)
+        min_r  = _first_num(traits, RAIN_MIN_KEYS)
+        max_r  = _first_num(traits, RAIN_MAX_KEYS)
+        min_t  = _first_num(traits, TEMP_MIN_KEYS)
+        max_t  = _first_num(traits, TEMP_MAX_KEYS)
+        canopy = _first_text(traits, CANOPY_KEYS, "Mixed")
+
+        score, facts = 1.0, []
+
+        # pH (strong)
+        if site_ph is not None and min_ph is not None and max_ph is not None:
+            if not (min_ph <= site_ph <= max_ph):
+                score *= 0.5
+            facts.append(f"pH {min_ph}-{max_ph}")
         else:
-            notes.append("Earth Engine not initialized; water balance unavailable.")
+            facts.append("pH unk")
 
-        # Biodiversity baseline (very rough): count species records for the enclosing state
-        if self.kb is not None:
-            try:
-                # This assumes you have a `species` table with a `state` column and
-                # a helper to map AOI → state. Replace with your own spatial join
-                # if available. Here we fall back to None if not present.
-                state_name = self._infer_state_name_from_aoi(aoi_geojson)
-                if state_name:
-                    sql = "SELECT COUNT(*) AS n FROM species WHERE state = :state"
-                    df = self.kb.query(sql, {"state": state_name})
-                    if isinstance(df, pd.DataFrame) and "n" in df.columns:
-                        bio_count = int(df["n"].iloc[0])
-                else:
-                    notes.append("Could not infer state from AOI; baseline biodiversity skipped.")
-            except Exception as e:
-                notes.append(f"DB biodiversity baseline failed: {e}")
+        # rainfall (strong)
+        if site_rain is not None and min_r is not None and max_r is not None:
+            if not (min_r <= site_rain <= max_r):
+                score *= 0.5
+            facts.append(f"rain {int(min_r)}-{int(max_r)}mm")
         else:
-            notes.append("DB not available; biodiversity baseline skipped.")
+            facts.append("rain unk")
 
-        return SiteFingerprint(
-            rainfall_mm=rainfall, pet_mm=pet, water_balance_mm=water_balance,
-            biodiversity_baseline_count=bio_count, notes=notes
+        # temperature (milder)
+        if site_tmp is not None and min_t is not None and max_t is not None:
+            if not (min_t <= site_tmp <= max_t):
+                score *= 0.7
+            facts.append(f"temp {min_t}-{max_t}°C")
+        else:
+            facts.append("temp unk")
+
+        if score >= min_compat:
+            out.append({
+                "species": sp,
+                "compatibility_score": float(score),
+                "traits": traits,
+                "canopy_layer": canopy,
+                "rationale": ", ".join(facts),
+            })
+
+    out.sort(key=lambda r: r["compatibility_score"], reverse=True)
+    return out
+
+# ---------------- Catalog fallback (score rows by pH/rain) ----------------
+def build_catalog_from_db(db_url: str) -> pd.DataFrame:
+    """Pivot species_traits and map synonyms into normalized columns."""
+    species_df = _get_all_species_df(db_url)
+    traits_df  = _get_all_traits_df(db_url)
+    if species_df.empty:
+        return pd.DataFrame(columns=["species", "min_ph", "max_ph", "min_rain_mm", "max_rain_mm", "canopy_layer", "notes"])
+
+    pivot = pd.DataFrame({"species_key": []})
+    if not traits_df.empty:
+        pivot = (
+            traits_df.dropna(subset=["trait_name"])
+                     .pivot_table(index="species_key", columns="trait_name", values="trait_value", aggfunc="first")
+                     .reset_index()
         )
 
-    def _infer_state_name_from_aoi(self, aoi_geojson: Dict[str, Any]) -> Optional[str]:
-        # Placeholder: if your DB exposes a spatial layer, do a real spatial join.
-        # Here we return None to keep the engine generic.
+    df = species_df.merge(pivot, on="species_key", how="left")
+    df["species"] = df["scientific_name"].fillna(df["canonical_name"])
+
+    def _pick_num(row, keys):  # helper to pull numeric with synonyms
+        for k in keys:
+            if k in row and pd.notna(row[k]):
+                return _coerce_float(row[k])
         return None
 
-    # ---------- B) Guild Recommender ----------
-    def recommend_guild(self, goal: str, priorities: Dict[str, str], k: int = 8) -> List[str]:
-        if self.rec is None:
-            return []
-        try:
-            # Strategy: pick a seed species then expand by semantic similarity.
-            # If your IntelligentRecommender exposes dedicated methods, swap these calls.
-            seed_list = self.rec.recommend_species(f"{goal}. Priorities: {priorities}", k=1)
-            seed = seed_list[0] if seed_list else None
-            if seed is None:
-                return self.rec.recommend_species(goal, k=k)
-            # Expand around the seed
-            guild = [seed] + [s for s in self.rec.recommend_species(f"similar to {seed}", k=k*2) if s != seed]
-            # Deduplicate and trim to k
-            seen = set()
-            out = []
-            for s in guild:
-                if s not in seen:
-                    out.append(s); seen.add(s)
-                if len(out) >= k:
-                    break
-            return out
-        except Exception:
-            # Fallback: single-pass recommendation
-            try:
-                return self.rec.recommend_species(goal, k=k)
-            except Exception:
-                return []
+    def _pick_text(row, keys):
+        for k in keys:
+            if k in row and pd.notna(row[k]) and str(row[k]).strip():
+                return str(row[k])
+        return "Unknown"
 
-    # ---------- C) Scoring (DB-backed when available) ----------
-    def score_guild(self, species_list: List[str], priorities: Dict[str, str]) -> pd.DataFrame:
-        # Columns: species, iucn, carbon_rate, canopy_layer, successional_role, scores...
-        rows: List[Dict[str, Any]] = []
-        for sp in species_list:
-            rows.append({
-                "species": sp,
-                "iucn": None,
-                "carbon_rate": None,
-                "canopy_layer": None,
-                "successional_role": None,
-            })
-        df = pd.DataFrame(rows)
+    df["min_ph"]       = df.apply(lambda r: _pick_num(r, PH_MIN_KEYS), axis=1)
+    df["max_ph"]       = df.apply(lambda r: _pick_num(r, PH_MAX_KEYS), axis=1)
+    df["min_rain_mm"]  = df.apply(lambda r: _pick_num(r, RAIN_MIN_KEYS), axis=1)
+    df["max_rain_mm"]  = df.apply(lambda r: _pick_num(r, RAIN_MAX_KEYS), axis=1)
+    df["canopy_layer"] = df.apply(lambda r: _pick_text(r, CANOPY_KEYS), axis=1)
+    df["notes"]        = df.get("notes", pd.Series([None]*len(df)))
 
-        if self.kb is not None and not df.empty:
-            try:
-                # Example trait fetch; adjust to your schema
-                placeholders = ", ".join([":s" + str(i) for i in range(len(df))])
-                params = {("s" + str(i)): sp for i, sp in enumerate(df["species"].tolist())}
-                sql = f"""
-                    SELECT species, iucn_status AS iucn, carbon_sequestration_rate AS carbon_rate,
-                           canopy_layer, successional_role
-                    FROM species_traits
-                    WHERE species IN ({placeholders})
-                """
-                trait_df = self.kb.query(sql, params)
-                if isinstance(trait_df, pd.DataFrame) and not trait_df.empty:
-                    df = df.drop(columns=[c for c in ["iucn","carbon_rate","canopy_layer","successional_role"] if c in df.columns]) \
-                           .merge(trait_df, on="species", how="left")
-            except Exception:
-                pass
+    keep = ["species", "min_ph", "max_ph", "min_rain_mm", "max_rain_mm", "canopy_layer", "notes"]
+    return df[keep].dropna(subset=["species"]).reset_index(drop=True)
 
-        # Compute simple scores
-        def iucn_points(x: str) -> int:
-            if x is None: return 0
-            x = x.upper()
-            return {"CR": 5, "EN": 4, "VU": 3, "NT": 2}.get(x, 1)  # LC=1, unknown=0→1
+def compatibility_fallback(site: Dict[str, Any], catalog: pd.DataFrame, strictness: str, k: int = 20) -> pd.DataFrame:
+    """Score species by pH and rainfall compatibility; return top-k rows."""
+    if catalog.empty:
+        return pd.DataFrame(columns=["species", "score", "rationale", "canopy_layer", "notes"])
 
-        df["biodiversity_score"] = df["iucn"].map(iucn_points).fillna(0)
+    ph   = _coerce_float(site.get("soil_ph"))
+    rain = _coerce_float(site.get("annual_precip_mm"))
 
-        # Carbon score: normalize by max among guild
-        if "carbon_rate" in df.columns and df["carbon_rate"].notna().any():
-            mx = float(df["carbon_rate"].max(skipna=True))
-            df["carbon_score"] = (df["carbon_rate"].astype(float) / (mx if mx > 0 else 1.0)).clip(0, 1)
-        else:
-            df["carbon_score"] = 0.0
-
-        # Canopy structure bonus if guild spans all layers
-        layers = set([str(x) for x in df["canopy_layer"].dropna().unique().tolist()])
-        layer_bonus = 1.0 if {"Upper Canopy", "Mid-story", "Shrub Layer"}.issubset(layers) else 0.5 if layers else 0.0
-        df["canopy_diversity_bonus"] = layer_bonus
-
-        # Weighted overall score by priorities
-        p1 = priorities.get("primary", "")
-        p2 = priorities.get("secondary", "")
-        w_bio = 0.5 if "biodiversity" in (p1 + p2) else 0.25
-        w_car = 0.5 if "carbon" in (p1 + p2) else 0.25
-        w_other = 1.0 - (w_bio + w_car)
-        df["overall_score"] = (w_bio * df["biodiversity_score"].astype(float) / 5.0) + \
-                              (w_car * df["carbon_score"].astype(float)) + \
-                              (w_other * df["canopy_diversity_bonus"])
-
-        return df.sort_values("overall_score", ascending=False).reset_index(drop=True)
-
-    # ---------- Models ----------
-    def run_models(self, site_tif: Optional[Path], use_unet: bool, use_resnet: bool) -> Dict[str, Any]:
-        out: Dict[str, Any] = {}
-        if site_tif is None:
-            return out
-
-        if use_unet and MODEL_RUNNER_OK and UNET_MODEL_PATH.exists():
-            try:
-                out["unet_pred"] = run_unet_inference(
-                    model_path=UNET_MODEL_PATH, geotiff_path=site_tif, num_classes=UNET_NUM_CLASSES
-                )
-            except Exception as e:
-                out["unet_error"] = str(e)
-        elif use_unet:
-            out["unet_error"] = "U-Net model or runner unavailable."
-
-        if use_resnet and MODEL_RUNNER_OK and RESNET_MODEL_PATH.exists():
-            try:
-                out["resnet_pred"] = run_resnet_inference(
-                    model_path=RESNET_MODEL_PATH, geotiff_path=site_tif, num_classes=RESNET_NUM_CLASSES
-                )
-            except Exception as e:
-                out["resnet_error"] = str(e)
-        elif use_resnet:
-            out["resnet_error"] = "ResNet model or runner unavailable."
-
-        return out
-
-    # ---------- Phase Timeline ----------
-    def make_timeline(self, scored_df: pd.DataFrame) -> Dict[str, List[str]]:
-        # Group species by successional role into phases
-        phases = {
-            "Year 1–3 (Establishment)": [],
-            "Year 4–7 (Growth)": [],
-            "Year 8+ (Maturity)": [],
-        }
-        if scored_df is None or scored_df.empty:
-            return phases
-
-        for _, row in scored_df.iterrows():
-            sp = str(row["species"])
-            role = (str(row.get("successional_role", "")) or "").lower()
-            if "pioneer" in role or "early" in role:
-                phases["Year 1–3 (Establishment)"].append(sp)
-            elif "mid" in role or "intermediate" in role:
-                phases["Year 4–7 (Growth)"].append(sp)
-            elif "climax" in role or "late" in role:
-                phases["Year 8+ (Maturity)"].append(sp)
+    def score_row(r: pd.Series) -> float:
+        s = 0.0
+        # pH (60%)
+        if ph is not None and pd.notna(r.get("min_ph")) and pd.notna(r.get("max_ph")):
+            if r["min_ph"] <= ph <= r["max_ph"]:
+                s += 0.6
             else:
-                # distribute by canopy for variety if no role is present
-                canopy = (str(row.get("canopy_layer", "")) or "").lower()
-                if "shrub" in canopy:
-                    phases["Year 1–3 (Establishment)"].append(sp)
-                elif "mid" in canopy:
-                    phases["Year 4–7 (Growth)"].append(sp)
+                d = min(abs(ph - r["min_ph"]), abs(ph - r["max_ph"]))
+                if strictness == "Strict":
+                    s += 0.0
+                elif strictness == "Soft":
+                    s += max(0.0, 0.6 - 0.15 * d)
                 else:
-                    phases["Year 8+ (Maturity)"].append(sp)
-        return phases
+                    s += max(0.0, 0.6 - 0.25 * d)
+        # rainfall (40%)
+        if rain is not None and pd.notna(r.get("min_rain_mm")) and pd.notna(r.get("max_rain_mm")):
+            if r["min_rain_mm"] <= rain <= r["max_rain_mm"]:
+                s += 0.4
+            else:
+                d = min(abs(rain - r["min_rain_mm"]), abs(rain - r["max_rain_mm"]))
+                if strictness == "Strict":
+                    s += 0.0
+                elif strictness == "Soft":
+                    s += max(0.0, 0.4 - 0.00006 * d)
+                else:
+                    s += max(0.0, 0.4 - 0.0001 * d)
+        return s
 
-engine = AnalysisEngine(kb=kb, recommender=recommender)
+    df = catalog.copy()
+    if "species" not in df.columns:
+        df["species"] = [f"species_{i}" for i in range(len(df))]
 
-# ------------------------------------------------------------------------------
-# Output — Stage 3: PLAN (only when user clicks)
-# ------------------------------------------------------------------------------
-def _render_water_overlay_on_map(aoi_geojson: Dict[str, Any]):
-    # Show AOI + optional JRC water layer using folium (fallback if no leafmap)
-    if not _FOLIUM_OK:
-        st.info("Map overlay requires folium + streamlit-folium.")
-        return
+    df["score"] = df.apply(score_row, axis=1)
+    rows = []
+    for _, r in df.sort_values("score", ascending=False).head(k).iterrows():
+        rationale = []
+        if ph is not None and pd.notna(r.get("min_ph")) and pd.notna(r.get("max_ph")):
+            rationale.append(f"pH {'within' if r['min_ph'] <= ph <= r['max_ph'] else 'near'} {r['min_ph']}-{r['max_ph']}")
+        if rain is not None and pd.notna(r.get("min_rain_mm")) and pd.notna(r.get("max_rain_mm")):
+            rationale.append(
+                f"rain {'within' if r['min_rain_mm'] <= rain <= r['max_rain_mm'] else 'near'} "
+                f"{int(r['min_rain_mm'])}-{int(r['max_rain_mm'])} mm"
+            )
+        if not rationale:
+            rationale.append("Insufficient trait ranges in DB.")
+        rows.append({
+            "species": str(r.get("species", "Unknown")),
+            "score": float(r.get("score", 0.0)),
+            "rationale": "; ".join(rationale),
+            "canopy_layer": r.get("canopy_layer") or "Unknown",
+            "notes": r.get("notes"),
+        })
+    return pd.DataFrame(rows)
 
-    fmap = folium.Map(location=[22.5, 79.0], zoom_start=5, control_scale=True, tiles="CartoDB positron")
-
-    # AOI polygon
-    try:
-        folium.GeoJson(aoi_geojson, name="AOI", style_function=lambda x: {"color": "#0d6efd", "weight": 2, "fillOpacity": 0.05}).add_to(fmap)
-    except Exception:
-        pass
-
-    if _EE_OK and ee is not None:
-        try:
-            geom = ee.Geometry(aoi_geojson)
-            jrc = ee.Image("JRC/GSW1_4/GlobalSurfaceWater").select("occurrence")
-            vis = {"min": 0, "max": 100, "palette": ["#ffffff", "#2ca2f0"]}
-            map_id = ee.data.getMapId({"image": jrc.visualize(**vis).getMapId()["image"]})  # compat trick
-        except Exception:
-            map_id = None
-
-        # Simpler approach via leaflet tile if map_id available
-        try:
-            tile = jrc.visualize(**vis).getMapId()
-            folium.raster_layers.TileLayer(
-                tiles=tile["tile_fetcher"].url_format, attr="JRC GSW", name="Water Occurrence", overlay=True, control=True, opacity=0.6
-            ).add_to(fmap)
-        except Exception:
-            pass
-
-    folium.LayerControl().add_to(fmap)
-    st_folium(fmap, height=420, use_container_width=True)
-
-def _to_frame(items: Union[List[str], List[Tuple[Any, ...]], List[Dict[str, Any]], pd.DataFrame]) -> pd.DataFrame:
-    if isinstance(items, pd.DataFrame):
-        return items
-    if isinstance(items, list):
-        if not items:
-            return pd.DataFrame(columns=["Result"])
-        if isinstance(items[0], dict):
-            return pd.DataFrame(items)
-        if isinstance(items[0], (list, tuple)):
-            m = max(len(x) for x in items)
-            return pd.DataFrame([list(x) for x in items], columns=[f"col_{i}" for i in range(m)])
-        return pd.DataFrame({"Recommended Species": items})
-    return pd.DataFrame({"Result": [items]})
-
+# ---------------- Main ----------------
 if run_clicked:
-    # Resolve AOI + site path
-    if aoi_geojson is None:
-        st.error("Please provide an AOI (draw on map, upload, or paste GeoJSON).")
+    # Parse AOI
+    try:
+        coords = [float(c.strip()) for c in aoi_input_str.split(",")]
+        if len(coords) != 4:
+            raise ValueError("Provide exactly 4 numbers: lon1,lat1,lon2,lat2")
+        aoi_geom = ee.Geometry.Rectangle(coords)
+    except Exception as e:
+        st.error(f"Invalid AOI coordinates: {e}")
         st.stop()
 
-    site_path = _resolve_site_path(site_path_text, uploaded_tif)
-    if use_unet or use_resnet:
-        if site_path is None:
-            st.warning("No site GeoTIFF provided; model outputs will be skipped.")
-
-    # ------------ Analysis panel ------------
     st.header("📊 Comprehensive Restoration Plan")
 
-    col1, col2 = st.columns([1, 1])
+    with st.spinner("Analyzing site with GEE and running AI models..."):
+        # --- Site fingerprint via Earth Engine ---
+        site_fingerprint = get_site_fingerprint(aoi_geom)
+        if site_fingerprint.get("status") != "Success":
+            st.error(f"Site analysis failed: {site_fingerprint.get('message')}")
+            st.stop()
 
+        # --- AOI download (real attempt first; then placeholder-friendly helper) ---
+        downloaded = try_real_aoi_download(aoi_geom, AOI_TIF_PATH, scale=10)
+        if not downloaded:
+            # Prepare directories and continue; no actual export in demo helper
+            _ = download_aoi_as_geotiff(aoi_geom, AOI_TIF_PATH)
+
+        # --- Optional local inference on AOI GeoTIFF ---
+        can_run_resnet = resnet_ok and AOI_TIF_PATH.exists()
+        can_run_unet   = unet_ok and AOI_TIF_PATH.exists()
+
+        resnet_map = None
+        unet_map = None
+        if can_run_resnet:
+            try:
+                resnet_map = run_resnet_inference(RESNET_MODEL_PATH, AOI_TIF_PATH, num_classes=12)
+                if isinstance(resnet_map, np.ndarray):
+                    _save_labelmap_png(resnet_map, RESNET_PNG)
+            except Exception as e:
+                logging.warning(f"ResNet inference skipped: {e}")
+        if can_run_unet:
+            try:
+                unet_map = run_unet_inference(UNET_MODEL_PATH, AOI_TIF_PATH, num_classes=3)
+                if isinstance(unet_map, np.ndarray):
+                    _save_labelmap_png(unet_map, UNET_PNG)
+            except Exception as e:
+                logging.warning(f"U-Net inference skipped: {e}")
+
+        # --- Semantic recommendations (candidate list) ---
+        semantic_species: List[str] = []
+        if recommender is not None:
+            try:
+                # ask for more, filter down later
+                semantic_species = recommender.recommend_species(goal_query, k=50) or []
+            except Exception as e:
+                logging.warning(f"Semantic recommendation skipped: {e}")
+
+        # --- Filter semantic candidates with micro-level env. filter ---
+        filtered_semantic = []
+        if semantic_species:
+            filtered_semantic = apply_environmental_filter(
+                semantic_species, site_fingerprint, kb, min_compat=min_compat
+            )
+
+        # --- DB-backed fallback (all species) if semantic path is empty or sparse ---
+        catalog_df  = build_catalog_from_db(DB_URL)
+        fallback_df = pd.DataFrame()
+        if not filtered_semantic:
+            fallback_df = compatibility_fallback(site_fingerprint, catalog_df, strictness=strictness, k=20)
+
+    col1, col2 = st.columns(2, gap="large")
+
+    # 1A) Spatial analysis rendering
     with col1:
-        st.subheader("1) Site Analysis")
-        with st.spinner("Computing site fingerprint…"):
-            fp = engine.site_fingerprint(aoi_geojson)
-        kpis = []
-        if fp.water_balance_mm is not None:
-            kpis.append(("Water balance (12 mo)", f"{fp.water_balance_mm:,.0f} mm"))
-        if fp.rainfall_mm is not None:
-            kpis.append(("Rainfall (12 mo)", f"{fp.rainfall_mm:,.0f} mm"))
-        if fp.pet_mm is not None:
-            kpis.append(("PET proxy (12 mo)", f"{fp.pet_mm:,.0f} mm"))
-        if fp.biodiversity_baseline_count is not None:
-            kpis.append(("Baseline species records", f"{fp.biodiversity_baseline_count:,}"))
-        if kpis:
-            a, b = st.columns(2)
-            for i, (k, v) in enumerate(kpis):
-                (a if i % 2 == 0 else b).metric(k, v)
-        if fp.notes:
-            st.caption("Notes:")
-            for n in fp.notes:
-                st.caption(f"• {n}")
-
-        st.markdown("**Interactive Water Context**")
-        _render_water_overlay_on_map(aoi_geojson)
-
-    with col2:
-        st.subheader("2) AI Model Insights")
-        # Preview
-        if site_path is not None:
-            prev = _rgb_preview(site_path)
-            if prev is not None:
-                st.image(prev, caption="Site RGB preview", use_container_width=True)
-        with st.spinner("Running selected models…"):
-            model_out = engine.run_models(site_path, use_unet=use_unet, use_resnet=use_resnet)
-        if "unet_error" in model_out:
-            st.warning(f"U-Net: {model_out['unet_error']}")
-        if "resnet_error" in model_out:
-            st.warning(f"ResNet: {model_out['resnet_error']}")
-        if "unet_pred" in model_out:
-            up = model_out["unet_pred"]
-            # If your runner returns a mask ndarray, try showing; otherwise show path/summary
-            if isinstance(up, np.ndarray):
-                # quick palette
-                cmap = np.array([[220, 53, 69], [255, 193, 7], [40, 167, 69]], dtype=np.uint8)
-                idx = np.clip(up.astype(int), 0, cmap.shape[0]-1)
-                rgba = np.concatenate([cmap[idx], np.full((*idx.shape,1), 200, dtype=np.uint8)], axis=-1)
-                st.image(rgba, caption="Suitability (U-Net)", use_column_width=True)
+        st.subheader("1. AI-Powered Spatial Analysis")
+        # ResNet quicklook or placeholder
+        if AOI_TIF_PATH.exists() and (RESNET_PNG.exists() or PLACEHOLDER_RESNET_IMG.exists()):
+            if RESNET_PNG.exists():
+                st.image(str(RESNET_PNG), caption="Land Cover Classification (ResNet)")
+            elif PLACEHOLDER_RESNET_IMG.exists():
+                st.image(str(PLACEHOLDER_RESNET_IMG), caption="Land Cover Classification (ResNet placeholder)")
+        else:
+            if PLACEHOLDER_RESNET_IMG.exists():
+                st.image(str(PLACEHOLDER_RESNET_IMG), caption="Land Cover Classification (ResNet placeholder)")
             else:
-                st.write("U-Net output:", up)
-        if "resnet_pred" in model_out:
-            st.write("ResNet output:", model_out["resnet_pred"])
+                st.info("Add a placeholder at assets/placeholder_resnet_map.png")
 
-    st.divider()
-    st.subheader("3) Intelligent Species Recommendation")
-    with st.spinner("Forming a synergistic species guild…"):
-        guild = engine.recommend_guild(goal_query, priorities, k=10)
-        scored = engine.score_guild(guild, priorities) if guild else pd.DataFrame()
-    if scored is not None and not scored.empty:
-        st.dataframe(scored, use_container_width=True)
-        st.download_button(
-            "⬇️ Download scored guild (CSV)",
-            data=scored.to_csv(index=False).encode("utf-8"),
-            file_name="manthan_scored_guild.csv",
-            mime="text/csv",
-        )
+        # U-Net quicklook or placeholder
+        if AOI_TIF_PATH.exists() and (UNET_PNG.exists() or PLACEHOLDER_UNET_IMG.exists()):
+            if UNET_PNG.exists():
+                st.image(str(UNET_PNG), caption="Restoration Suitability Map (U-Net)")
+            elif PLACEHOLDER_UNET_IMG.exists():
+                st.image(str(PLACEHOLDER_UNET_IMG), caption="Restoration Suitability Map (U-Net placeholder)")
+        else:
+            if PLACEHOLDER_UNET_IMG.exists():
+                st.image(str(PLACEHOLDER_UNET_IMG), caption="Restoration Suitability Map (U-Net placeholder)")
+            else:
+                st.info("Add a placeholder at assets/placeholder_unet_map.png")
+
+        if not AOI_TIF_PATH.exists():
+            st.caption("ℹ️ AOI GeoTIFF not found: either the download failed or GEE export isn't fully enabled.")
+        if not resnet_ok or not unet_ok:
+            st.caption("ℹ️ Model inference skipped: missing weights in `models/artifacts/`.")
+
+    # 1B) Site fingerprint
+    with col2:
+        st.subheader("2. Site Fingerprint")
+        ndvi = site_fingerprint.get("ndvi_mean", 0) or 0
+        rain = site_fingerprint.get("annual_precip_mm", 0) or 0
+        ph   = site_fingerprint.get("soil_ph", 0) or 0
+        elev = site_fingerprint.get("elevation_mean_m", 0) or 0
+        slope = site_fingerprint.get("slope_mean_deg", 0) or 0
+
+        st.metric("Vegetation Health (NDVI)", f"{ndvi:.2f}")
+        st.metric("Annual Rainfall", f"{rain:.0f} mm")
+        st.metric("Avg. Soil pH", f"{ph:.2f}")
+        st.metric("Elevation", f"{elev:.0f} m")
+        st.metric("Slope", f"{slope:.1f}°")
+
+        with st.expander("View Complete Site Fingerprint"):
+            st.json(site_fingerprint)
+
+    # 2) Recommended species blueprint
+    st.subheader("3. Recommended Species Blueprint")
+
+    if filtered_semantic:
+        st.write("#### Intelligent Recommender (semantic → micro-filter)")
+        df = pd.DataFrame(filtered_semantic)
+        # Present by canopy layer
+        lower = df["canopy_layer"].astype(str).str.lower().fillna("unknown")
+
+        def _show_group(lbl: str, mask: pd.Series):
+            tbl = df[mask]
+            if not tbl.empty:
+                st.write(f"##### {lbl}")
+                st.dataframe(
+                    tbl[["species", "compatibility_score", "rationale", "canopy_layer"]]
+                    .rename(columns={"compatibility_score": "score"})
+                    .reset_index(drop=True),
+                    use_container_width=True
+                )
+
+        _show_group("Upper Canopy", lower.str.contains("upper", na=False))
+        _show_group("Mid-story",   lower.str.contains("mid", na=False))
+        _show_group("Shrub Layer / Understory", lower.str.contains("shrub|under", na=False, regex=True))
+
+        with st.expander("See full semantic table"):
+            st.dataframe(df.reset_index(drop=True), use_container_width=True)
+
     else:
-        st.info("No recommendations available (recommender unavailable or returned no results).")
+        st.caption("ℹ️ Semantic recommender returned no items (or traits were insufficient); using DB-driven compatibility instead.")
 
-    st.divider()
-    st.subheader("4) Phased Planting Timeline")
-    phases = engine.make_timeline(scored if scored is not None else pd.DataFrame())
-    with st.expander("Year 1–3 (Establishment Phase)", expanded=True):
-        est = phases.get("Year 1–3 (Establishment)", [])
-        if est:
-            st.markdown("- Soil builders & early yield (NTFPs):")
-            st.write(", ".join(est))
+    if not filtered_semantic:
+        if fallback_df is None or fallback_df.empty:
+            st.warning("No species could be recommended with the available DB traits.")
+            with st.expander("Why am I seeing few/no species?"):
+                catalog_df = build_catalog_from_db(DB_URL)
+                stats = {
+                    "species_in_db": int(len(_get_all_species_df(DB_URL))),
+                    "traits_rows": int(len(_get_all_traits_df(DB_URL))),
+                    "catalog_with_min_ph": int((catalog_df["min_ph"].notna().sum() if "min_ph" in catalog_df else 0)),
+                    "catalog_with_max_ph": int((catalog_df["max_ph"].notna().sum() if "max_ph" in catalog_df else 0)),
+                    "catalog_with_rain_min": int((catalog_df["min_rain_mm"].notna().sum() if "min_rain_mm" in catalog_df else 0)),
+                    "catalog_with_rain_max": int((catalog_df["max_rain_mm"].notna().sum() if "max_rain_mm" in catalog_df else 0)),
+                }
+                st.json(stats)
+                st.caption("Tip: add quantitative traits in `species_traits`: "
+                           "`min_ph`, `max_ph`, `min_rain_mm`, `max_rain_mm`, and optionally `canopy_layer`.")
         else:
-            st.write("No assignments yet.")
-    with st.expander("Year 4–7 (Growth Phase)", expanded=True):
-        gr = phases.get("Year 4–7 (Growth)", [])
-        if gr:
-            st.markdown("- Introduce mid-story for layered canopy:")
-            st.write(", ".join(gr))
-        else:
-            st.write("No assignments yet.")
-    with st.expander("Year 8+ (Maturity Phase)", expanded=True):
-        mat = phases.get("Year 8+ (Maturity)", [])
-        if mat:
-            st.markdown("- Long-term stability & carbon capture:")
-            st.write(", ".join(mat))
-        else:
-            st.write("No assignments yet.")
+            st.write("#### DB-driven compatibility (micro-filter)")
+            df = fallback_df.copy()
+            lower = df["canopy_layer"].astype(str).str.lower().fillna("unknown")
 
-    st.divider()
-    st.subheader("5) Executive Summary")
-    bullets = [
-        f"Profile: **{profile}** — priorities: **{priorities.get('primary','-')}**, **{priorities.get('secondary','-')}**.",
-        "Target high-suitability micro-zones first; phase pioneers → mid-story → climax.",
-        "Blend fast growers with drought-tolerant natives; diversify canopy layers.",
-        "Water plan: harvest & store in upper catchments; supplement in dry months.",
-        "Review survival quarterly; iterate guild with field feedback.",
-    ]
-    st.markdown("\n".join([f"- {b}" for b in bullets]))
+            def _show_group2(lbl: str, mask: pd.Series):
+                tbl = df[mask]
+                if not tbl.empty:
+                    st.write(f"##### {lbl}")
+                    cols = ["species", "score", "rationale"]
+                    if "notes" in tbl.columns:
+                        cols.append("notes")
+                    st.dataframe(tbl[cols].reset_index(drop=True), use_container_width=True)
 
-# ------------------------------------------------------------------------------
-# Diagnostics
-# ------------------------------------------------------------------------------
-with st.expander("⚙️ Diagnostics"):
-    st.write("Repo root:", REPO_ROOT)
-    st.write("DB URL:", DB_URL)
-    st.write("Embeddings dir exists:", EMBEDDINGS_DIR.exists())
-    st.write("U-Net model:", str(UNET_MODEL_PATH), "| exists:", UNET_MODEL_PATH.exists())
-    st.write("ResNet model:", str(RESNET_MODEL_PATH), "| exists:", RESNET_MODEL_PATH.exists())
-    st.write("Recommender import OK:", RECOMMENDER_OK)
-    if not RECOMMENDER_OK: st.code(repr(_RECOMMENDER_IMPORT_ERR))
-    st.write("Model runner import OK:", MODEL_RUNNER_OK)
-    if not MODEL_RUNNER_OK: st.code(repr(_MODEL_RUNNER_IMPORT_ERR))
-    st.write("DB import OK:", DB_OK)
-    if not DB_OK: st.code(repr(_DB_IMPORT_ERR))
-    st.write("Earth Engine initialized:", _EE_OK)
-    if not _EE_OK and _EE_IMPORTED:
-        st.info("Tip: `earthengine authenticate` (locally) or set GOOGLE_APPLICATION_CREDENTIALS for service account.")
+            _show_group2("Upper Canopy", lower.str.contains("upper", na=False))
+            _show_group2("Mid-story",   lower.str.contains("mid", na=False))
+            _show_group2("Shrub Layer / Understory", lower.str.contains("shrub|under", na=False, regex=True))
+
+            with st.expander("See full fallback table"):
+                st.dataframe(df.reset_index(drop=True), use_container_width=True)
+
+else:
+    st.info("Enter an AOI rectangle in the sidebar and click **Generate Plan** to get started.")

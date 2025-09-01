@@ -1,4 +1,16 @@
-# intelligent_recommender.py - Patched version
+# instant_fix.py - Instantly fix your app by patching the import
+
+import os
+import sys
+from pathlib import Path
+
+def apply_instant_fix():
+    """Apply the instant fix by creating a wrapper module"""
+    
+    print("🚀 Applying instant fix for sentence-transformers segmentation fault...")
+    
+    # Create the patch file
+    patch_content = '''# intelligent_recommender.py - Patched version
 """
 This is a patched version that avoids the sentence-transformers segmentation fault.
 It uses transformers directly instead of sentence-transformers.
@@ -112,3 +124,65 @@ class IntelligentRecommender:
         except Exception as e:
             print(f"Recommendation error: {e}")
             return [m['species_name'] for m in self.metadata[:k]]
+'''
+    
+    # Find the manthan_core directory
+    possible_paths = [
+        Path("manthan_core/recommender"),
+        Path("./manthan_core/recommender"),
+        Path("../manthan_core/recommender"),
+    ]
+    
+    recommender_dir = None
+    for path in possible_paths:
+        if path.exists():
+            recommender_dir = path
+            break
+    
+    if recommender_dir is None:
+        # Create it in current directory
+        recommender_dir = Path("manthan_core/recommender")
+        recommender_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create __init__.py files
+        (Path("manthan_core") / "__init__.py").touch()
+        (recommender_dir / "__init__.py").touch()
+    
+    # Write the patched file
+    patch_file = recommender_dir / "intelligent_recommender.py"
+    with open(patch_file, 'w') as f:
+        f.write(patch_content)
+    
+    print(f"✓ Patched file created at: {patch_file}")
+    
+    # Create a test script
+    test_script = '''# test_patch.py
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path.cwd()))
+
+try:
+    from manthan_core.recommender.intelligent_recommender import IntelligentRecommender
+    print("✓ Import successful!")
+    
+    # Test it
+    recommender = IntelligentRecommender(Path("./data/embeddings"))
+    species = recommender.recommend_species("drought tolerant trees", k=5)
+    print(f"✓ Got {len(species)} recommendations:", species)
+    print("\\n✅ Patch is working! You can now run your Streamlit app.")
+    
+except Exception as e:
+    print(f"✗ Error: {e}")
+'''
+    
+    with open("test_patch.py", 'w') as f:
+        f.write(test_script)
+    
+    print("\n📋 Instructions:")
+    print("1. Test the patch: python test_patch.py")
+    print("2. Run your app: streamlit run intelligent_app.py")
+    print("\nThe patched version bypasses sentence-transformers completely.")
+    print("Your app should now work without segmentation faults!")
+
+if __name__ == "__main__":
+    apply_instant_fix()

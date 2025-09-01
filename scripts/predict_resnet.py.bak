@@ -1,0 +1,389 @@
+# scripts/predict_resnet.py
+from __future__ import annotations
+
+import argparse
+import logging
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+from PIL import Image
+
+import torch
+from torchvision import models, transforms
+
+import rasterio
+from rasterio.windows import Window
+from rasterio.warp import transform_bounds
+
+# Optional (HTML & districts). If missing, we degrade gracefully.
+try:
+    import folium
+    from folium import Map
+    from folium.raster_layers import ImageOverlay
+    from folium.plugins import MousePosition
+    OPTIONAL_HTML = True
+except Exception:
+    OPTIONAL_HTML = False
+
+try:
+    import geopandas as gpd
+    from shapely.geometry import Polygon
+    OPTIONAL_GPD = True
+except Exception:
+    OPTIONAL_GPD = False
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# ------------------------------------------------------------------------------------
+# Configuration-like defaults (adjust to your training setup)
+# ------------------------------------------------------------------------------------
+DEFAULT_MODEL_PATH = Path("models/artifacts/resnet34_pan_india_weights.pth")
+DEFAULT_NUM_CLASSES = 12
+DEFAULT_PATCH_SIZE = 256
+
+# ESA WorldCover code set (adjust to your label set if different)
+INDEX_TO_ESA = [10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 100, 0]  # last = unknown/other
+
+# Color maps for PNG rendering
+COLOR_MAP_ESA: Dict[int, Tuple[int, int, int]] = {
+    10: (0, 100, 0),     # Trees
+    20: (255, 187, 34),  # Shrubland
+    30: (255, 255, 76),  # Grassland
+    40: (240, 150, 255), # Cropland
+    50: (255, 0, 0),     # Built-up
+    60: (210, 210, 210), # Bare / sparse
+    70: (255, 255, 255), # Snow/Ice
+    80: (0, 0, 255),     # Permanent water
+    90: (0, 255, 255),   # Herbaceous wetland
+    95: (0, 128, 128),   # Mangroves
+    100:(191, 255, 0),   # Moss & lichen
+    0:  (0, 0, 0),       # Unknown / other
+}
+
+# If your model outputs 0..11 and you want a direct index-based PNG (without ESA codes)
+COLOR_MAP_INDEX: Dict[int, Tuple[int, int, int]] = {
+    i: COLOR_MAP_ESA.get(INDEX_TO_ESA[i], (0, 0, 0)) for i in range(len(INDEX_TO_ESA))
+}
+
+
+# ------------------------------------------------------------------------------------
+# Utilities
+# ------------------------------------------------------------------------------------
+def device_select() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def build_model(model_path: Path, num_classes: int, device: torch.device) -> torch.nn.Module:
+    model = models.resnet34()
+    model.fc = torch.nn.Linear(model.fc.in_features, num_classes)
+    state = torch.load(model_path, map_location=device)
+    model.load_state_dict(state)
+    model.to(device)
+    model.eval()
+    return model
+
+
+def bounds_polygon_latlon(tif_path: Path):
+    """Return a shapely Polygon of the dataset bounds in EPSG:4326 and the [left,bottom,right,top]."""
+    with rasterio.open(tif_path) as src:
+        left, bottom, right, top = transform_bounds(src.crs, "EPSG:4326", *src.bounds)
+    poly = Polygon([(left, bottom), (right, bottom), (right, top), (left, top)])
+    return poly, (left, bottom, right, top)
+
+
+def districts_for_raster_extent(
+    tif_path: Path, districts_path: Path, name_field: Optional[str] = None
+) -> List[str]:
+    """
+    Intersects raster extent (in WGS84) with districts layer and returns district names.
+    Supports GeoJSON/Shapefile via GeoPandas.
+    """
+    if not OPTIONAL_GPD:
+        logging.warning("geopandas/shapely not installed; skipping district lookup.")
+        return []
+    if not districts_path.exists():
+        logging.warning(f"Districts file not found: {districts_path}")
+        return []
+
+    poly, _ = bounds_polygon_latlon(tif_path)
+    aoi = gpd.GeoDataFrame(geometry=[poly], crs="EPSG:4326")
+
+    gdf = gpd.read_file(districts_path)
+    if gdf.crs is None:
+        gdf = gdf.set_crs("EPSG:4326")
+    else:
+        gdf = gdf.to_crs("EPSG:4326")
+
+    inter = gpd.overlay(gdf, aoi, how="intersection")
+    if inter.empty:
+        return []
+
+    # Find a usable name field
+    if name_field and name_field in inter.columns:
+        col = name_field
+    else:
+        candidates = ["DISTRICT", "District", "district", "NAME_2", "NAME", "ADM2_EN", "adm2_en"]
+        col = next((c for c in candidates if c in inter.columns), None)
+        if col is None:
+            return [f"district_{i}" for i in range(len(inter))]
+
+    names = sorted(set(inter[col].astype(str).str.strip().tolist()))
+    return names
+
+
+def save_prediction_as_png(pred: np.ndarray, png_path: Path, use_esa_codes: bool):
+    """
+    Convert a class array to a color PNG. If use_esa_codes=True, pred already contains ESA codes.
+    Otherwise, pred contains model indices and we use COLOR_MAP_INDEX.
+    """
+    h, w = pred.shape
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+
+    cmap = COLOR_MAP_ESA if use_esa_codes else COLOR_MAP_INDEX
+    keys = list(cmap.keys())
+    for k in keys:
+        rgb[pred == k] = cmap[k]
+
+    Image.fromarray(rgb).save(png_path)
+    logging.info(f"✅ PNG saved: {png_path}")
+
+
+def make_shareable_html_map(
+    color_png_path: Path,
+    geotiff_path: Path,
+    html_out: Path,
+    districts: Optional[List[str]] = None,
+    title: str = "Map"
+):
+    if not OPTIONAL_HTML:
+        logging.warning("folium not installed; cannot create HTML map.")
+        return
+
+    _, (left, bottom, right, top) = bounds_polygon_latlon(geotiff_path)
+    center = [(bottom + top) / 2.0, (left + right) / 2.0]
+
+    m = Map(location=center, zoom_start=13, tiles="OpenStreetMap")
+    ImageOverlay(
+        name="Classification",
+        image=str(color_png_path),
+        bounds=[[bottom, left], [top, right]],
+        opacity=0.65,
+        interactive=True,
+        cross_origin=False,
+    ).add_to(m)
+
+    MousePosition(position="bottomleft").add_to(m)
+
+    # Legend + districts (simple legend of class codes)
+    # (If you want a fancier legend, customize here.)
+    legend_rows = []
+    for k in sorted(COLOR_MAP_ESA.keys()):
+        r, g, b = COLOR_MAP_ESA[k]
+        legend_rows.append(
+            f'<div style="display:flex;align-items:center;margin:2px 0">'
+            f'<span style="display:inline-block;width:14px;height:14px;background:rgb({r},{g},{b});border:1px solid #555;margin-right:8px"></span>'
+            f'<span>{k}</span>'
+            f"</div>"
+        )
+    district_html = f"<b>Districts:</b> {', '.join(districts)}" if districts else ""
+
+    legend_html = f"""
+    <div style="
+        position: fixed; bottom: 20px; left: 20px; z-index: 9999;
+        background: white; padding: 10px 12px; border-radius: 8px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.25); font-size: 13px;">
+      <div style="font-weight:600; margin-bottom:6px">{title}</div>
+      <div style="margin-bottom:6px">{district_html}</div>
+      <div style="font-weight:600; margin-bottom:4px">Legend (ESA codes)</div>
+      {''.join(legend_rows)}
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend_html))
+    m.save(str(html_out))
+    logging.info(f"🌍 HTML map saved: {html_out}")
+
+
+# ------------------------------------------------------------------------------------
+# Prediction
+# ------------------------------------------------------------------------------------
+def predict(
+    image_path: Path,
+    output_geotiff_path: Path,
+    model_path: Path,
+    num_classes: int,
+    out_png: Optional[Path] = None,
+    out_html: Optional[Path] = None,
+    write_esa_codes: bool = False,
+    rgb_bands: Tuple[int, int, int] = (1, 2, 3),
+    patch_size: int = DEFAULT_PATCH_SIZE,
+    scale_factor: float = 1.0,
+    districts_path: Optional[Path] = None,
+    district_name_field: Optional[str] = None,
+):
+    """
+    Runs a trained ResNet model on a GeoTIFF and saves:
+      - classification GeoTIFF (1 band of class indices or ESA codes)
+      - optional color PNG
+      - optional shareable HTML map
+      - logs district names if a districts layer is provided
+    """
+    device = device_select()
+    logging.info(f"Using device: {device}")
+
+    model = build_model(model_path, num_classes, device)
+
+    transform_img = transforms.Compose([
+        transforms.ToTensor(),  # HWC uint8->[0,1], float stays float
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225])
+    ])
+
+    with rasterio.open(image_path) as src:
+        meta = src.meta.copy()
+        meta.update(count=1, dtype="uint16" if write_esa_codes else "uint8", compress="lzw")
+
+        # Predict by native tiling (fast & memory safe). Falls back to full read if untiled.
+        if src.block_shapes[0] is not None:
+            windows = [w for _, w in src.block_windows(1)]
+        else:
+            # Fallback: slide over the raster in PATCH_SIZE steps
+            windows = []
+            for row in range(0, src.height, patch_size):
+                for col in range(0, src.width, patch_size):
+                    h = min(patch_size, src.height - row)
+                    w = min(patch_size, src.width - col)
+                    windows.append(Window(col_off=col, row_off=row, width=w, height=h))
+
+        with rasterio.open(output_geotiff_path, "w", **meta) as dst:
+            for win in windows:
+                # Read requested RGB bands (1-based indexing in Rasterio)
+                try:
+                    img_patch = src.read(indexes=list(rgb_bands), window=win)  # (C, H, W)
+                except Exception:
+                    # If bands missing, read all and pick first 3
+                    arr = src.read(window=win)
+                    if arr.shape[0] < 3:
+                        raise RuntimeError("Input image has <3 bands; cannot run RGB-based classifier.")
+                    img_patch = arr[:3]
+
+                # CHW->HWC
+                hwc = np.transpose(img_patch, (1, 2, 0))
+
+                # Optional scale (e.g., if original is 0..10000)
+                if scale_factor != 1.0:
+                    hwc = hwc.astype(np.float32) / float(scale_factor)
+
+                # To tensor
+                ten = transform_img(hwc).unsqueeze(0).to(device)
+
+                with torch.no_grad():
+                    logits = model(ten)
+                    pred_idx = torch.argmax(logits, dim=1).squeeze(0)  # (h, w)
+
+                pred = pred_idx.detach().cpu().numpy()
+
+                # Optionally convert to ESA codes before writing
+                if write_esa_codes:
+                    # Vectorize mapping
+                    lut = np.zeros(max(INDEX_TO_ESA) + 1 if INDEX_TO_ESA else pred.max() + 1, dtype=np.uint16)
+                    # Build LUT for 0..N-1 -> ESA code
+                    for i, code in enumerate(INDEX_TO_ESA[:pred.max()+1]):
+                        lut[i] = code
+                    pred_out = lut[pred]
+                else:
+                    pred_out = pred.astype(np.uint8)
+
+                dst.write(pred_out, window=win, indexes=1)
+
+    logging.info(f"✅ Prediction map saved: {output_geotiff_path}")
+
+    # Districts (from raster extent)
+    names: List[str] = []
+    if districts_path is not None:
+        names = districts_for_raster_extent(output_geotiff_path, districts_path, district_name_field)
+        if names:
+            logging.info(f"📍 District(s): {', '.join(names)}")
+        else:
+            logging.info("📍 District(s): none found / no overlap.")
+
+    # PNG
+    if out_png is not None:
+        # If we wrote ESA codes to GeoTIFF, load back from disk so PNG uses same values
+        with rasterio.open(output_geotiff_path) as src_pred:
+            arr = src_pred.read(1)
+        save_prediction_as_png(arr, out_png, use_esa_codes=write_esa_codes)
+
+    # HTML
+    if out_html is not None:
+        if not OPTIONAL_HTML:
+            logging.warning("folium not installed; cannot create HTML map.")
+        else:
+            if out_png is None:
+                # Need a PNG to overlay; create a temp one next to the TIF
+                tmp_png = output_geotiff_path.with_suffix(".png")
+                with rasterio.open(output_geotiff_path) as src_pred:
+                    arr = src_pred.read(1)
+                save_prediction_as_png(arr, tmp_png, use_esa_codes=write_esa_codes)
+                color_png = tmp_png
+            else:
+                color_png = out_png
+
+            make_shareable_html_map(
+                color_png_path=color_png,
+                geotiff_path=output_geotiff_path,
+                html_out=out_html,
+                districts=names,
+                title="Suitability / Land Cover"
+            )
+
+
+# ------------------------------------------------------------------------------------
+# CLI
+# ------------------------------------------------------------------------------------
+def main():
+    p = argparse.ArgumentParser(description="Run ResNet land-cover/suitability inference on a GeoTIFF.")
+    p.add_argument("--image", required=True, type=Path, help="Input GeoTIFF (AOI)")
+    p.add_argument("--out-tif", required=True, type=Path, help="Output classification GeoTIFF")
+    p.add_argument("--out-png", type=Path, default=None, help="Optional color PNG for non-technical users")
+    p.add_argument("--out-html", type=Path, default=None, help="Optional shareable interactive HTML map")
+    p.add_argument("--model", type=Path, default=DEFAULT_MODEL_PATH, help="Model weights (.pth)")
+    p.add_argument("--num-classes", type=int, default=DEFAULT_NUM_CLASSES)
+    p.add_argument("--patch-size", type=int, default=DEFAULT_PATCH_SIZE)
+    p.add_argument("--scale-factor", type=float, default=1.0, help="Divide raw pixel values by this before normalization")
+    p.add_argument("--write-esa-codes", action="store_true",
+                   help="Write ESA codes (10,20,...) instead of raw class indices into GeoTIFF/PNG")
+    p.add_argument("--rgb-bands", type=int, nargs=3, default=(1, 2, 3),
+                   help="Which 3 bands to treat as RGB (1-based)")
+    p.add_argument("--districts", type=Path, default=None, help="Districts GeoJSON/Shapefile")
+    p.add_argument("--district-name-field", type=str, default=None, help="Field name for district names")
+    args = p.parse_args()
+
+    args.out_tif.parent.mkdir(parents=True, exist_ok=True)
+    if args.out_png:
+        args.out_png.parent.mkdir(parents=True, exist_ok=True)
+    if args.out_html:
+        args.out_html.parent.mkdir(parents=True, exist_ok=True)
+
+    predict(
+        image_path=args.image,
+        output_geotiff_path=args.out_tif,
+        model_path=args.model,
+        num_classes=args.num_classes,
+        out_png=args.out_png,
+        out_html=args.out_html,
+        write_esa_codes=args.write_esa_codes,
+        rgb_bands=tuple(args.rgb_bands),
+        patch_size=args.patch_size,
+        scale_factor=args.scale_factor,
+        districts_path=args.districts,
+        district_name_field=args.district_name_field,
+    )
+
+
+if __name__ == "__main__":
+    main()

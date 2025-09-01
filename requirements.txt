@@ -1,14 +1,20 @@
-# requirements.txt
+# requirements.txt (for Docker)
+streamlit
 pandas
 numpy
-torch
-torchvision
-streamlit
+sqlalchemy
 geopy
 requests
 python-dotenv
-sqlalchemy
+ee
 psycopg2-binary
-# Geospatial libraries
+
+# AI & ML Libraries
+torch --index-url https://download.pytorch.org/whl/cpu
+torchvision --index-url https://download.pytorch.org/whl/cpu
+sentence-transformers
+faiss-cpu
+
+# Geospatial (pip can handle these in a Linux env)
 rasterio
 geopandas
